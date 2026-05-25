@@ -3,4 +3,4 @@ pandas
 pydantic
 plotly
 numpy
-matplotlib
+python-docx
