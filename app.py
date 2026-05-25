@@ -17,11 +17,6 @@ st.markdown("""
         font-family: 'Inter', sans-serif;
     }
     
-    /* Hide Streamlit Branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
     /* Premium Metric Cards */
     div[data-testid="metric-container"] {
         background-color: rgba(30, 41, 59, 0.5);
@@ -36,13 +31,6 @@ st.markdown("""
         color: #38bdf8 !important;
         font-weight: 600 !important;
         letter-spacing: -0.5px;
-    }
-    
-    /* Dataframes */
-    .stDataFrame {
-        border-radius: 8px !important;
-        overflow: hidden !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -61,7 +49,6 @@ class Cylinder(BaseModel):
 # --- 3. ADVANCED THERMODYNAMIC ENGINE ---
 def run_elite_diagnostics(df: pd.DataFrame):
     diagnostics = []
-    
     avg_exh = df['exhaust_temp'].mean()
     
     for _, row in df.iterrows():
@@ -69,7 +56,7 @@ def run_elite_diagnostics(df: pd.DataFrame):
         ratio = row['p_max'] / row['p_comp']
         delta_exh = row['exhaust_temp'] - avg_exh
         
-        # 1. Combustion Efficiency (The Ultimate Truth)
+        # 1. Combustion Efficiency Check
         if ratio < 1.3:
             diagnostics.append({
                 "cyl": cyl,
@@ -97,49 +84,37 @@ def run_elite_diagnostics(df: pd.DataFrame):
     return diagnostics
 
 def create_pv_chart(df: pd.DataFrame):
-    """Generates a premium interactive chart using Plotly"""
     fig = go.Figure()
 
-    # Pmax Line
     fig.add_trace(go.Scatter(
         x=df['id'], y=df['p_max'], 
-        name='Pmax (bar)',
-        mode='lines+markers',
-        line=dict(color='#0ea5e9', width=3),
-        marker=dict(size=10, symbol='diamond')
+        name='Pmax (bar)', mode='lines+markers',
+        line=dict(color='#0ea5e9', width=3), marker=dict(size=10, symbol='diamond')
     ))
 
-    # Pcomp Line
     fig.add_trace(go.Scatter(
         x=df['id'], y=df['p_comp'], 
-        name='Pcomp (bar)',
-        mode='lines+markers',
-        line=dict(color='#8b5cf6', width=3),
-        marker=dict(size=10)
+        name='Pcomp (bar)', mode='lines+markers',
+        line=dict(color='#8b5cf6', width=3), marker=dict(size=10)
     ))
 
-    # Shaded Ideal Ratio Area (Visualizing Thermodynamics)
     ideal_pmax_lower = df['p_comp'] * 1.3
     ideal_pmax_upper = df['p_comp'] * 1.5
     
     fig.add_trace(go.Scatter(
         x=pd.concat([df['id'], df['id'][::-1]]),
         y=pd.concat([ideal_pmax_upper, ideal_pmax_lower[::-1]]),
-        fill='toself',
-        fillcolor='rgba(14, 165, 233, 0.1)',
-        line=dict(color='rgba(255,255,255,0)'),
-        name='Optimal Combustion Zone'
+        fill='toself', fillcolor='rgba(14, 165, 233, 0.1)',
+        line=dict(color='rgba(255,255,255,0)'), name='Optimal Combustion Zone'
     ))
 
     fig.update_layout(
         title="Thermodynamic Pressure Profile",
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(color='#94a3b8'),
         xaxis=dict(title="Cylinder", showgrid=False, tickmode='linear'),
         yaxis=dict(title="Pressure (bar)", showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=50, b=20)
+        hovermode="x unified", margin=dict(l=20, r=20, t=50, b=20)
     )
     return fig
 
@@ -151,17 +126,16 @@ uploaded_file = st.file_uploader("Initiate Data Uplink (.doc / .docx)", type=["d
 
 if uploaded_file:
     with st.spinner("Executing ISO Normalization & Thermodynamic Analysis..."):
-        time.sleep(1) # UI polish
+        time.sleep(1)
         
         try:
-            # Mock Extraction of validated data
             raw_cylinders = [
                 Cylinder(id=1, p_max=80.0, p_comp=58.0, exhaust_temp=320.0),
                 Cylinder(id=2, p_max=81.0, p_comp=59.0, exhaust_temp=345.0),
                 Cylinder(id=3, p_max=80.0, p_comp=59.0, exhaust_temp=350.0),
                 Cylinder(id=4, p_max=80.0, p_comp=59.0, exhaust_temp=345.0),
                 Cylinder(id=5, p_max=88.0, p_comp=58.0, exhaust_temp=330.0), 
-                Cylinder(id=6, p_max=72.0, p_comp=58.0, exhaust_temp=338.0), # Intentionally dropping Pmax to trigger ratio fault
+                Cylinder(id=6, p_max=72.0, p_comp=58.0, exhaust_temp=338.0), 
             ]
             
             df = pd.DataFrame([{
@@ -169,20 +143,17 @@ if uploaded_file:
                 "ratio": cyl.combustion_ratio
             } for cyl in raw_cylinders])
             
-            # Top-Level Executive Metrics
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Engine Load Index", "87 RPM", "Ballast Condition")
             m2.metric("Mean Pmax", f"{df['p_max'].mean():.1f} bar")
             m3.metric("Mean Exhaust", f"{df['exhaust_temp'].mean():.0f} °C")
             
-            # The Critical Ratio Metric
             avg_ratio = df['ratio'].mean()
             ratio_color = "normal" if 1.3 <= avg_ratio <= 1.5 else "inverse"
             m4.metric("Avg Combustion Ratio", f"{avg_ratio:.2f}", "Ideal: 1.3 - 1.5", delta_color=ratio_color)
             
             st.markdown("<br>", unsafe_allow_html=True)
             
-            # Central Visual & Diagnostics
             col_chart, col_alerts = st.columns([1.5, 1])
             
             with col_chart:
@@ -205,12 +176,20 @@ if uploaded_file:
                             </div>
                             """, unsafe_allow_html=True)
 
-            # Data Table Layer
-            with st.expander("VIEW RAW THERMODYNAMIC MATRIX", expanded=False):
-                styled_df = df.style.background_gradient(cmap='Blues', subset=['p_max', 'p_comp']) \
-                                    .background_gradient(cmap='OrRd', subset=['exhaust_temp']) \
-                                    .format({'ratio': "{:.2f}"})
-                st.dataframe(styled_df, use_container_width=True)
+            # --- THE FIX: Streamlit Native Premium Data Grid ---
+            with st.expander("VIEW RAW THERMODYNAMIC MATRIX", expanded=True):
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "id": st.column_config.NumberColumn("Cylinder", format="%d"),
+                        "p_max": st.column_config.ProgressColumn("Pmax (bar)", format="%.1f", min_value=0, max_value=150),
+                        "p_comp": st.column_config.ProgressColumn("Pcomp (bar)", format="%.1f", min_value=0, max_value=150),
+                        "exhaust_temp": st.column_config.NumberColumn("Exhaust Temp (°C)", format="%.1f"),
+                        "ratio": st.column_config.NumberColumn("Combustion Ratio", format="%.2f")
+                    }
+                )
                 
         except ValidationError as e:
             st.error("CRITICAL: Data Integrity Failure.")
