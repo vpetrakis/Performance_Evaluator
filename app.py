@@ -3,12 +3,11 @@ import pandas as pd
 import plotly.graph_objects as go
 from pydantic import BaseModel, Field, ValidationError
 import olefile
+import re
 from io import BytesIO
-import json
-from openai import OpenAI
 
 # --- UI CONFIGURATION ---
-st.set_page_config(page_title="M.E. Diagnostic Hub", page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="M.E. Diagnostic Hub", page_icon="⚙️", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
     <style>
@@ -18,26 +17,11 @@ st.markdown("""
         padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
     h1, h2, h3 { color: #38bdf8 !important; font-weight: 600 !important; }
+    .cyl-block { background-color: rgba(30, 41, 59, 0.3); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; border: 1px solid rgba(255,255,255,0.05); }
     </style>
 """, unsafe_allow_html=True)
 
-# --- UPGRADE 1: DYNAMIC BASELINE ENGINE ---
-class EngineBaselines:
-    @staticmethod
-    def get_shop_trial_targets(rpm: float):
-        """
-        Dynamically calculates expected thermodynamic parameters based on engine RPM 
-        (Approximated for MAN-B&W 5S60MC-C MK8).
-        """
-        if rpm >= 100:
-            return {"pmax_target": 145.0, "pcomp_target": 105.0}
-        elif rpm >= 85:
-            return {"pmax_target": 120.0, "pcomp_target": 80.0}
-        elif rpm >= 70:
-            return {"pmax_target": 95.0, "pcomp_target": 65.0}
-        else:
-            return {"pmax_target": 75.0, "pcomp_target": 50.0}
-
+# --- DATA INTEGRITY SHIELD ---
 class Cylinder(BaseModel):
     id: int = Field(..., ge=1, le=12)
     p_max: float = Field(..., gt=0)
@@ -48,97 +32,62 @@ class Cylinder(BaseModel):
     def combustion_ratio(self) -> float:
         return self.p_max / self.p_comp
 
-# --- UPGRADE 2: AI DATA PIPELINE ---
+# --- PURE PYTHON HEURISTIC PARSER ---
 def extract_raw_binary(file_bytes):
-    """Pulls the shattered binary text from the legacy .doc using pure Python."""
     ole = olefile.OleFileIO(BytesIO(file_bytes))
     if ole.exists('WordDocument'):
         return ole.openstream('WordDocument').read().decode('ascii', errors='ignore')
-    raise ValueError("Invalid Document Structure: Cannot read OLE stream.")
+    return ""
 
-def ai_heuristic_extraction(raw_text: str) -> pd.DataFrame:
-    """
-    Sends the shattered text to an LLM to logically reconstruct the grid, 
-    bypassing the 'invisible shift' bug entirely.
-    """
-    try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    except KeyError:
-        st.error("🚨 API Key Missing! Please add OPENAI_API_KEY to your Streamlit Secrets.")
-        st.stop()
-        
-    client = OpenAI(api_key=api_key)
+def heuristic_decoder(raw_text):
+    """Attempts to assign numbers based on engineering logic, leaving 0.0 if confused."""
+    all_numbers = [float(x) for x in re.findall(r'\b\d{2,3}(?:\.\d+)?\b', raw_text)]
+    cylinders = []
     
-    prompt = f"""
-    You are a marine engineer. Read this corrupted text stream from a MAN-B&W 5S60MC-C engine log.
-    Reconstruct the thermodynamic parameters for Cylinders 1 through 6. 
-    Account for missing or blank rows (e.g., Pi bar is often left blank, so numbers shift).
-    Normal ranges: Pcomp (45-70), Pmax (70-150), Exhaust Temp (280-450).
+    p_comp_candidates = [n for n in all_numbers if 45 <= n <= 68]
+    p_max_candidates = [n for n in all_numbers if 69 <= n <= 140]
+    exh_candidates = [n for n in all_numbers if 280 <= n <= 450]
     
-    Return ONLY a raw JSON array of 6 objects with exact keys: id, p_max, p_comp, exhaust_temp.
-    Do not include markdown blocks or any other text.
-    
-    Raw Text:
-    {raw_text[:2000]} 
-    """
-    
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"} # Forces perfect JSON output
-    )
-    
-    try:
-        response_content = response.choices[0].message.content
-        parsed_json = json.loads(response_content)
-        # Handle cases where the AI wraps the array in a parent object
-        data_list = parsed_json if isinstance(parsed_json, list) else list(parsed_json.values())[0]
-        
-        valid_cylinders = [Cylinder(**row) for row in data_list]
-        return pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
-    except Exception as e:
-        raise ValueError(f"AI Reconstruction Failed to parse valid thermodynamics. Detail: {e}")
+    for i in range(1, 7):
+        cylinders.append({
+            "id": i,
+            "p_max": p_max_candidates[i-1] if len(p_max_candidates) >= i else 0.0,
+            "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 0.0,
+            "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 0.0,
+        })
+    return cylinders
 
 # --- ELITE DIAGNOSTICS ENGINE ---
-def run_dynamic_diagnostics(df: pd.DataFrame, rpm: float):
+def run_diagnostics(df: pd.DataFrame):
     diagnostics = []
     avg_exh = df['exhaust_temp'].mean()
-    targets = EngineBaselines.get_shop_trial_targets(rpm)
-    target_ratio = targets['pmax_target'] / targets['pcomp_target']
-    
-    # Dynamic thresholds based on load
-    lower_ratio_limit = target_ratio * 0.90
-    upper_ratio_limit = target_ratio * 1.15
     
     for _, row in df.iterrows():
         cyl = int(row['id'])
         ratio = row['ratio']
         delta_exh = row['exhaust_temp'] - avg_exh
         
-        if ratio < lower_ratio_limit:
-            diagnostics.append({"cyl": cyl, "status": "🔴 CRITICAL", "fault": f"Poor Combustion (Ratio {ratio:.2f} below dynamic target {lower_ratio_limit:.2f})", "action": "Check fuel pump timing, worn plunger, or atomizers."})
-        elif ratio > upper_ratio_limit:
-            diagnostics.append({"cyl": cyl, "status": "🟡 WARNING", "fault": f"Harsh Combustion (Ratio {ratio:.2f} above dynamic target {upper_ratio_limit:.2f})", "action": "Check for early injection timing or fuel quality."})
+        if ratio < 1.3:
+            diagnostics.append({"cyl": cyl, "status": "🔴 CRITICAL", "fault": "Poor Combustion (Ratio < 1.3)", "action": "Check fuel pump timing, worn plunger, or atomizers."})
+        elif ratio > 1.55:
+            diagnostics.append({"cyl": cyl, "status": "🟡 WARNING", "fault": "Harsh Combustion (Ratio > 1.55)", "action": "Check for early injection timing or fuel quality."})
             
-        if delta_exh > 15 and row['p_comp'] < (targets['pcomp_target'] - 5):
+        if ratio >= 1.3 and delta_exh > 15 and row['p_comp'] < df['p_comp'].mean() - 2:
             diagnostics.append({"cyl": cyl, "status": "🔴 CRITICAL", "fault": "Loss of Compression / Blow-by", "action": "Overhaul required. Inspect exhaust valve and piston rings."})
             
     return diagnostics
 
-def create_pv_chart(df: pd.DataFrame, rpm: float):
-    targets = EngineBaselines.get_shop_trial_targets(rpm)
-    target_ratio = targets['pmax_target'] / targets['pcomp_target']
-    
+def create_pv_chart(df: pd.DataFrame):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['id'], y=df['p_max'], name='Pmax (bar)', mode='lines+markers', line=dict(color='#0ea5e9', width=3), marker=dict(size=10, symbol='diamond')))
     fig.add_trace(go.Scatter(x=df['id'], y=df['p_comp'], name='Pcomp (bar)', mode='lines+markers', line=dict(color='#8b5cf6', width=3), marker=dict(size=10)))
 
-    ideal_pmax_lower = df['p_comp'] * (target_ratio * 0.90)
-    ideal_pmax_upper = df['p_comp'] * (target_ratio * 1.15)
+    ideal_pmax_lower = df['p_comp'] * 1.3
+    ideal_pmax_upper = df['p_comp'] * 1.5
     
     fig.add_trace(go.Scatter(
         x=pd.concat([df['id'], df['id'][::-1]]), y=pd.concat([ideal_pmax_upper, ideal_pmax_lower[::-1]]),
-        fill='toself', fillcolor='rgba(14, 165, 233, 0.1)', line=dict(color='rgba(255,255,255,0)'), name=f'Dynamic Combustion Zone ({rpm} RPM)'
+        fill='toself', fillcolor='rgba(14, 165, 233, 0.1)', line=dict(color='rgba(255,255,255,0)'), name='Optimal Combustion Zone'
     ))
 
     fig.update_layout(
@@ -150,45 +99,74 @@ def create_pv_chart(df: pd.DataFrame, rpm: float):
 
 # --- UI COMMAND CENTER ---
 st.title("M.E. PERFORMANCE COMMAND CENTER")
-
-# Sidebar for Dynamic Variables
-with st.sidebar:
-    st.markdown("### Engine Parameters")
-    vessel = st.selectbox("Vessel", ["M/V ALEXIS", "M/V BRISTOL"])
-    rpm_input = st.number_input("Current Load (RPM)", min_value=30.0, max_value=110.0, value=87.0, step=1.0)
-    st.markdown("---")
-    st.markdown("### Expected Shop Trials")
-    targets = EngineBaselines.get_shop_trial_targets(rpm_input)
-    st.metric("Target Pmax", f"{targets['pmax_target']} bar")
-    st.metric("Target Pcomp", f"{targets['pcomp_target']} bar")
+st.markdown("### Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 
 uploaded_file = st.file_uploader("Initiate Data Uplink (.doc)", type=["doc"])
 
 if uploaded_file:
-    with st.spinner("Executing AI Data Reconstruction & Thermodynamic Analysis..."):
+    # 1. Extract what we can from the legacy binary
+    raw_text = extract_raw_binary(uploaded_file.read())
+    guessed_data = heuristic_decoder(raw_text)
+    
+    st.markdown("---")
+    st.markdown("### ⚠️ DATA INTEGRITY VERIFICATION")
+    st.info("Legacy `.doc` formatting detected. The system has extracted the following parameters. Please verify and correct any missing (0.0) or shifted values before executing.")
+    
+    verified_data = []
+    
+    # 2. The Unbreakable Vertical UI
+    # Instead of a horizontal table that collapses, we use robust blocks.
+    with st.form("verification_form"):
+        for row in guessed_data:
+            st.markdown(f"<div class='cyl-block'><b>CYLINDER {row['id']}</b></div>", unsafe_allow_html=True)
+            
+            # Using 3 secure columns inside the block
+            c1, c2, c3 = st.columns(3)
+            p_max_val = c1.number_input("Pmax (bar)", value=float(row['p_max']), key=f"pmax_{row['id']}", min_value=0.0)
+            p_comp_val = c2.number_input("Pcomp (bar)", value=float(row['p_comp']), key=f"pcomp_{row['id']}", min_value=0.0)
+            exh_val = c3.number_input("Exhaust Temp (°C)", value=float(row['exhaust_temp']), key=f"exh_{row['id']}", min_value=0.0)
+            
+            verified_data.append({
+                "id": row['id'],
+                "p_max": p_max_val,
+                "p_comp": p_comp_val,
+                "exhaust_temp": exh_val
+            })
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        # 3. Execution Gate
+        submitted = st.form_submit_button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary", use_container_width=True)
+
+    if submitted:
         try:
-            raw_text = extract_raw_binary(uploaded_file.read())
-            final_df = ai_heuristic_extraction(raw_text)
+            # Validate the Chief Engineer's verified numbers through Pydantic
+            valid_cylinders = [Cylinder(**row) for row in verified_data]
+            final_df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
+            
+            st.markdown("---")
             
             # --- RENDER DASHBOARD ---
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Engine Load Index", f"{rpm_input} RPM")
-            m2.metric("Mean Pmax", f"{final_df['p_max'].mean():.1f} bar", f"{final_df['p_max'].mean() - targets['pmax_target']:.1f} vs Target")
+            m1.metric("Engine Load Index", "87 RPM", "Ballast Condition")
+            m2.metric("Mean Pmax", f"{final_df['p_max'].mean():.1f} bar")
             m3.metric("Mean Exhaust", f"{final_df['exhaust_temp'].mean():.0f} °C")
-            m4.metric("Avg Combustion Ratio", f"{final_df['ratio'].mean():.2f}")
+            
+            avg_ratio = final_df['ratio'].mean()
+            ratio_color = "normal" if 1.3 <= avg_ratio <= 1.5 else "inverse"
+            m4.metric("Avg Combustion Ratio", f"{avg_ratio:.2f}", "Ideal: 1.3 - 1.5", delta_color=ratio_color)
             
             st.markdown("<br>", unsafe_allow_html=True)
             col_chart, col_alerts = st.columns([1.5, 1])
             
             with col_chart:
-                st.plotly_chart(create_pv_chart(final_df, rpm_input), use_container_width=True)
+                st.plotly_chart(create_pv_chart(final_df), use_container_width=True)
                 
             with col_alerts:
-                st.markdown("### 🛠️ Dynamic Diagnostics")
-                diagnostics = run_dynamic_diagnostics(final_df, rpm_input)
+                st.markdown("### 🛠️ Root Cause Diagnostics")
+                diagnostics = run_diagnostics(final_df)
                 
                 if not diagnostics:
-                    st.success("🟢 **SYSTEM NOMINAL:** Thermodynamics match Shop Trial baselines.")
+                    st.success("🟢 **SYSTEM NOMINAL:** All thermodynamic ratios and thermal gradients are optimal.")
                 else:
                     for diag in diagnostics:
                         st.markdown(f"""
@@ -199,8 +177,5 @@ if uploaded_file:
                         </div>
                         """, unsafe_allow_html=True)
                         
-            with st.expander("VIEW AI-RECONSTRUCTED THERMODYNAMIC MATRIX", expanded=False):
-                st.dataframe(final_df, use_container_width=True, hide_index=True)
-                        
-        except Exception as e:
-            st.error(f"CRITICAL: Pipeline Failure. {str(e)}")
+        except ValidationError:
+            st.error("CRITICAL: Data Integrity Failure. A value entered in the grid violates thermodynamic limits (e.g., leaving a zero or entering Pcomp higher than Pmax). Please correct the fields above.")
