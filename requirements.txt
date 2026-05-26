@@ -4,3 +4,4 @@ pydantic
 plotly
 numpy
 olefile
+fpdf2
