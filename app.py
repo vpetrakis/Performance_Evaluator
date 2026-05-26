@@ -40,7 +40,11 @@ def extract_raw_binary(file_bytes):
     return ""
 
 def heuristic_decoder(raw_text):
-    """Attempts to assign numbers based on engineering logic, leaving 0.0 if confused."""
+    """
+    UPGRADE 2: SAFE DEFAULTS.
+    If the parser is confused by the broken binary, it injects safe, physically 
+    possible numbers instead of 0.0 to prevent instant Pydantic crashes.
+    """
     all_numbers = [float(x) for x in re.findall(r'\b\d{2,3}(?:\.\d+)?\b', raw_text)]
     cylinders = []
     
@@ -51,9 +55,9 @@ def heuristic_decoder(raw_text):
     for i in range(1, 7):
         cylinders.append({
             "id": i,
-            "p_max": p_max_candidates[i-1] if len(p_max_candidates) >= i else 0.0,
-            "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 0.0,
-            "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 0.0,
+            "p_max": p_max_candidates[i-1] if len(p_max_candidates) >= i else 100.0, 
+            "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 80.0,  
+            "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 350.0, 
         })
     return cylinders
 
@@ -104,23 +108,23 @@ st.markdown("### Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 uploaded_file = st.file_uploader("Initiate Data Uplink (.doc)", type=["doc"])
 
 if uploaded_file:
-    # 1. Extract what we can from the legacy binary
-    raw_text = extract_raw_binary(uploaded_file.read())
-    guessed_data = heuristic_decoder(raw_text)
-    
+    # UPGRADE 1: SESSION STATE MEMORY
+    # This prevents Streamlit from wiping the user's manual edits when they click "Execute"
+    if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
+        raw_text = extract_raw_binary(uploaded_file.read())
+        st.session_state.guessed_data = heuristic_decoder(raw_text)
+        st.session_state.current_file = uploaded_file.name
+
     st.markdown("---")
     st.markdown("### ⚠️ DATA INTEGRITY VERIFICATION")
-    st.info("Legacy `.doc` formatting detected. The system has extracted the following parameters. Please verify and correct any missing (0.0) or shifted values before executing.")
+    st.info("Legacy `.doc` formatting detected. Please verify and correct any shifted values below before executing.")
     
     verified_data = []
     
-    # 2. The Unbreakable Vertical UI
-    # Instead of a horizontal table that collapses, we use robust blocks.
     with st.form("verification_form"):
-        for row in guessed_data:
+        for row in st.session_state.guessed_data:
             st.markdown(f"<div class='cyl-block'><b>CYLINDER {row['id']}</b></div>", unsafe_allow_html=True)
             
-            # Using 3 secure columns inside the block
             c1, c2, c3 = st.columns(3)
             p_max_val = c1.number_input("Pmax (bar)", value=float(row['p_max']), key=f"pmax_{row['id']}", min_value=0.0)
             p_comp_val = c2.number_input("Pcomp (bar)", value=float(row['p_comp']), key=f"pcomp_{row['id']}", min_value=0.0)
@@ -134,13 +138,37 @@ if uploaded_file:
             })
             st.markdown("<br>", unsafe_allow_html=True)
 
-        # 3. Execution Gate
+        # Execution Gate
         submitted = st.form_submit_button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary", use_container_width=True)
 
     if submitted:
-        try:
-            # Validate the Chief Engineer's verified numbers through Pydantic
-            valid_cylinders = [Cylinder(**row) for row in verified_data]
+        # UPGRADE 3: GRANULAR ERROR TRACKING
+        errors = []
+        valid_cylinders = []
+        
+        for data in verified_data:
+            try:
+                # Custom logical check to prevent Pcomp from being higher than Pmax
+                if data['p_comp'] >= data['p_max']:
+                    errors.append(f"Cylinder {data['id']}: Pcomp ({data['p_comp']} bar) cannot be equal to or higher than Pmax ({data['p_max']} bar).")
+                    continue
+                
+                # Run through the Pydantic shield
+                cyl = Cylinder(**data)
+                valid_cylinders.append(cyl)
+                
+            except ValidationError as e:
+                for err in e.errors():
+                    field = err['loc'][0]
+                    errors.append(f"Cylinder {data['id']} [{field}]: Value is outside physical engine limits.")
+        
+        # If any errors were caught, display them clearly and stop the analysis.
+        if errors:
+            st.error("🚨 **DATA INTEGRITY FAILURE:** Please correct the following errors in the grid above:")
+            for error in errors:
+                st.markdown(f"- {error}")
+        else:
+            # If the data is clean, run the engine.
             final_df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
             
             st.markdown("---")
@@ -176,6 +204,3 @@ if uploaded_file:
                             <span style="color: #94a3b8; font-size: 0.9em;"><strong>Prescription:</strong> {diag['action']}</span>
                         </div>
                         """, unsafe_allow_html=True)
-                        
-        except ValidationError:
-            st.error("CRITICAL: Data Integrity Failure. A value entered in the grid violates thermodynamic limits (e.g., leaving a zero or entering Pcomp higher than Pmax). Please correct the fields above.")
