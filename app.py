@@ -5,7 +5,6 @@ from pydantic import BaseModel, Field, ValidationError
 import olefile
 import re
 from io import BytesIO
-import time
 
 # --- PREMIUM CSS INJECTION ---
 st.set_page_config(page_title="M.E. Diagnostic Hub", page_icon="⚙️", layout="wide", initial_sidebar_state="collapsed")
@@ -33,40 +32,24 @@ class Cylinder(BaseModel):
     def combustion_ratio(self) -> float:
         return self.p_max / self.p_comp
 
-# --- PURE PYTHON HEURISTIC PARSER (STREAMLIT SAFE) ---
+# --- HEURISTIC PARSER ---
 def heuristic_decoder(raw_text):
-    """Uses engineering logic to map numbers, bypassing Streamlit's lack of OS software."""
+    """Does its best to guess, but expects human verification."""
     all_numbers = [float(x) for x in re.findall(r'\b\d{2,3}(?:\.\d+)?\b', raw_text)]
-    cylinders = {i: {'id': i, 'p_max': None, 'p_comp': None, 'exhaust_temp': None} for i in range(1, 7)}
+    cylinders = []
     
     p_comp_candidates = [n for n in all_numbers if 45 <= n <= 68]
     p_max_candidates = [n for n in all_numbers if 69 <= n <= 140]
     exh_candidates = [n for n in all_numbers if 280 <= n <= 450]
     
-    try:
-        for i in range(1, 7):
-            if len(exh_candidates) >= i:
-                cylinders[i]['exhaust_temp'] = exh_candidates[i-1]
-            if len(p_comp_candidates) >= i:
-                cylinders[i]['p_comp'] = p_comp_candidates[i-1]
-            if len(p_max_candidates) >= i:
-                cylinders[i]['p_max'] = p_max_candidates[i-1]
-                
-        if not cylinders[1]['p_max'] or not cylinders[1]['exhaust_temp']:
-            raise ValueError("Data fragmentation too severe.")
-            
-        return [Cylinder(**cylinders[i]) for i in range(1, 7)]
-        
-    except Exception:
-        # Failsafe Dataset to guarantee 100% uptime on the UI
-        return [
-            Cylinder(id=1, p_max=80.0, p_comp=58.0, exhaust_temp=320.0),
-            Cylinder(id=2, p_max=81.0, p_comp=59.0, exhaust_temp=345.0),
-            Cylinder(id=3, p_max=80.0, p_comp=59.0, exhaust_temp=350.0),
-            Cylinder(id=4, p_max=80.0, p_comp=59.0, exhaust_temp=345.0),
-            Cylinder(id=5, p_max=88.0, p_comp=58.0, exhaust_temp=330.0), 
-            Cylinder(id=6, p_max=80.0, p_comp=58.0, exhaust_temp=338.0)
-        ]
+    for i in range(1, 7):
+        cylinders.append({
+            "id": i,
+            "p_max": p_max_candidates[i-1] if len(p_max_candidates) >= i else 0.0,
+            "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 0.0,
+            "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 0.0,
+        })
+    return pd.DataFrame(cylinders)
 
 def extract_from_binary(file_bytes):
     ole = olefile.OleFileIO(BytesIO(file_bytes))
@@ -74,7 +57,9 @@ def extract_from_binary(file_bytes):
         word_stream = ole.openstream('WordDocument').read()
         raw_text = word_stream.decode('ascii', errors='ignore')
         return heuristic_decoder(raw_text)
-    raise ValueError("Invalid OLE structure.")
+    
+    # Fallback Empty Grid if format is totally unrecognized
+    return pd.DataFrame([{"id": i, "p_max": 0.0, "p_comp": 0.0, "exhaust_temp": 0.0} for i in range(1, 7)])
 
 # --- ADVANCED THERMODYNAMIC ENGINE ---
 def run_elite_diagnostics(df: pd.DataFrame):
@@ -83,7 +68,7 @@ def run_elite_diagnostics(df: pd.DataFrame):
     
     for _, row in df.iterrows():
         cyl = int(row['id'])
-        ratio = row['p_max'] / row['p_comp']
+        ratio = row['ratio']
         delta_exh = row['exhaust_temp'] - avg_exh
         
         if ratio < 1.3:
@@ -122,20 +107,42 @@ st.markdown("### Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 uploaded_file = st.file_uploader("Initiate Data Uplink (.doc / .docx)", type=["doc", "docx"])
 
 if uploaded_file:
-    with st.spinner("Decoding OLE Stream & Applying Thermodynamic Heuristics..."):
-        time.sleep(1) 
-        
+    # 1. Extraction Phase
+    raw_df = extract_from_binary(uploaded_file.read())
+    
+    st.markdown("---")
+    st.markdown("### ⚠️ DATA INTEGRITY VERIFICATION")
+    st.info("Due to legacy `.doc` formatting, the automated extraction requires verification. Please click inside the table to correct any misaligned values, then click Execute.")
+    
+    # 2. Human-in-the-Loop Editable Grid
+    edited_df = st.data_editor(
+        raw_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "id": st.column_config.NumberColumn("Cylinder", disabled=True),
+            "p_max": st.column_config.NumberColumn("Pmax (bar)", min_value=0.0, format="%.1f"),
+            "p_comp": st.column_config.NumberColumn("Pcomp (bar)", min_value=0.0, format="%.1f"),
+            "exhaust_temp": st.column_config.NumberColumn("Exhaust Temp (°C)", min_value=0.0, format="%.1f")
+        }
+    )
+
+    # 3. Execution Gate
+    if st.button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary"):
         try:
-            file_bytes = uploaded_file.read()
-            raw_cylinders = extract_from_binary(file_bytes)
-            df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in raw_cylinders])
+            # Validate through Pydantic to ensure the user didn't enter physically impossible numbers
+            valid_cylinders = [Cylinder(**row) for row in edited_df.to_dict('records')]
+            final_df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
             
+            st.markdown("---")
+            
+            # --- RENDER DASHBOARD ---
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Engine Load Index", "87 RPM", "Ballast Condition")
-            m2.metric("Mean Pmax", f"{df['p_max'].mean():.1f} bar")
-            m3.metric("Mean Exhaust", f"{df['exhaust_temp'].mean():.0f} °C")
+            m2.metric("Mean Pmax", f"{final_df['p_max'].mean():.1f} bar")
+            m3.metric("Mean Exhaust", f"{final_df['exhaust_temp'].mean():.0f} °C")
             
-            avg_ratio = df['ratio'].mean()
+            avg_ratio = final_df['ratio'].mean()
             ratio_color = "normal" if 1.3 <= avg_ratio <= 1.5 else "inverse"
             m4.metric("Avg Combustion Ratio", f"{avg_ratio:.2f}", "Ideal: 1.3 - 1.5", delta_color=ratio_color)
             
@@ -143,11 +150,11 @@ if uploaded_file:
             col_chart, col_alerts = st.columns([1.5, 1])
             
             with col_chart:
-                st.plotly_chart(create_pv_chart(df), use_container_width=True)
+                st.plotly_chart(create_pv_chart(final_df), use_container_width=True)
                 
             with col_alerts:
                 st.markdown("### 🛠️ Root Cause Diagnostics")
-                diagnostics = run_elite_diagnostics(df)
+                diagnostics = run_elite_diagnostics(final_df)
                 
                 if not diagnostics:
                     st.success("🟢 **SYSTEM NOMINAL:** All thermodynamic ratios and thermal gradients are optimal.")
@@ -160,19 +167,6 @@ if uploaded_file:
                             <span style="color: #94a3b8; font-size: 0.9em;"><strong>Prescription:</strong> {diag['action']}</span>
                         </div>
                         """, unsafe_allow_html=True)
-
-            with st.expander("VIEW EXTRACTED THERMODYNAMIC MATRIX", expanded=True):
-                st.dataframe(
-                    df, use_container_width=True, hide_index=True,
-                    column_config={
-                        "id": st.column_config.NumberColumn("Cylinder", format="%d"),
-                        "p_max": st.column_config.ProgressColumn("Pmax (bar)", format="%.1f", min_value=0, max_value=150),
-                        "p_comp": st.column_config.ProgressColumn("Pcomp (bar)", format="%.1f", min_value=0, max_value=150),
-                        "exhaust_temp": st.column_config.NumberColumn("Exhaust Temp (°C)", format="%.1f"),
-                        "ratio": st.column_config.NumberColumn("Combustion Ratio", format="%.2f")
-                    }
-                )
-                
+                        
         except ValidationError as e:
-            st.error("CRITICAL: Data Integrity Failure. The extracted numbers violate thermodynamic realities.")
-            st.write(e)
+            st.error("CRITICAL: Data Integrity Failure. A value entered in the grid violates thermodynamic limits (e.g., Pcomp > Pmax or zero values). Please correct the table.")
