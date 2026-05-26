@@ -34,10 +34,8 @@ class Cylinder(BaseModel):
 
 # --- HEURISTIC PARSER ---
 def heuristic_decoder(raw_text):
-    """Does its best to guess, but expects human verification."""
     all_numbers = [float(x) for x in re.findall(r'\b\d{2,3}(?:\.\d+)?\b', raw_text)]
     cylinders = []
-    
     p_comp_candidates = [n for n in all_numbers if 45 <= n <= 68]
     p_max_candidates = [n for n in all_numbers if 69 <= n <= 140]
     exh_candidates = [n for n in all_numbers if 280 <= n <= 450]
@@ -49,7 +47,7 @@ def heuristic_decoder(raw_text):
             "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 0.0,
             "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 0.0,
         })
-    return pd.DataFrame(cylinders)
+    return cylinders
 
 def extract_from_binary(file_bytes):
     ole = olefile.OleFileIO(BytesIO(file_bytes))
@@ -57,15 +55,12 @@ def extract_from_binary(file_bytes):
         word_stream = ole.openstream('WordDocument').read()
         raw_text = word_stream.decode('ascii', errors='ignore')
         return heuristic_decoder(raw_text)
-    
-    # Fallback Empty Grid if format is totally unrecognized
-    return pd.DataFrame([{"id": i, "p_max": 0.0, "p_comp": 0.0, "exhaust_temp": 0.0} for i in range(1, 7)])
+    return [{"id": i, "p_max": 0.0, "p_comp": 0.0, "exhaust_temp": 0.0} for i in range(1, 7)]
 
 # --- ADVANCED THERMODYNAMIC ENGINE ---
 def run_elite_diagnostics(df: pd.DataFrame):
     diagnostics = []
     avg_exh = df['exhaust_temp'].mean()
-    
     for _, row in df.iterrows():
         cyl = int(row['id'])
         ratio = row['ratio']
@@ -78,21 +73,18 @@ def run_elite_diagnostics(df: pd.DataFrame):
             
         if ratio >= 1.3 and delta_exh > 15 and row['p_comp'] < df['p_comp'].mean() - 2:
             diagnostics.append({"cyl": cyl, "status": "🔴 CRITICAL", "fault": "Loss of Compression / Blow-by", "action": "Overhaul required. Inspect exhaust valve and piston rings."})
-            
     return diagnostics
 
 def create_pv_chart(df: pd.DataFrame):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['id'], y=df['p_max'], name='Pmax (bar)', mode='lines+markers', line=dict(color='#0ea5e9', width=3), marker=dict(size=10, symbol='diamond')))
     fig.add_trace(go.Scatter(x=df['id'], y=df['p_comp'], name='Pcomp (bar)', mode='lines+markers', line=dict(color='#8b5cf6', width=3), marker=dict(size=10)))
-
     ideal_pmax_lower = df['p_comp'] * 1.3
     ideal_pmax_upper = df['p_comp'] * 1.5
     fig.add_trace(go.Scatter(
         x=pd.concat([df['id'], df['id'][::-1]]), y=pd.concat([ideal_pmax_upper, ideal_pmax_lower[::-1]]),
         fill='toself', fillcolor='rgba(14, 165, 233, 0.1)', line=dict(color='rgba(255,255,255,0)'), name='Optimal Combustion Zone'
     ))
-
     fig.update_layout(
         title="Thermodynamic Pressure Profile", plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(color='#94a3b8'), xaxis=dict(title="Cylinder", showgrid=False, tickmode='linear'),
@@ -107,36 +99,44 @@ st.markdown("### Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 uploaded_file = st.file_uploader("Initiate Data Uplink (.doc / .docx)", type=["doc", "docx"])
 
 if uploaded_file:
-    # 1. Extraction Phase
-    raw_df = extract_from_binary(uploaded_file.read())
+    raw_data = extract_from_binary(uploaded_file.read())
     
     st.markdown("---")
     st.markdown("### ⚠️ DATA INTEGRITY VERIFICATION")
-    st.info("Due to legacy `.doc` formatting, the automated extraction requires verification. Please click inside the table to correct any misaligned values, then click Execute.")
+    st.info("Please verify the extracted parameters. Correct any misaligned values, then click Execute.")
     
-    # 2. Human-in-the-Loop Editable Grid
-    edited_df = st.data_editor(
-        raw_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "id": st.column_config.NumberColumn("Cylinder", disabled=True),
-            "p_max": st.column_config.NumberColumn("Pmax (bar)", min_value=0.0, format="%.1f"),
-            "p_comp": st.column_config.NumberColumn("Pcomp (bar)", min_value=0.0, format="%.1f"),
-            "exhaust_temp": st.column_config.NumberColumn("Exhaust Temp (°C)", min_value=0.0, format="%.1f")
-        }
-    )
+    # --- BULLETPROOF NATIVE GRID (Bypasses Pandas UI Bugs) ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.markdown("**Cylinder**")
+    col2.markdown("**Pmax (bar)**")
+    col3.markdown("**Pcomp (bar)**")
+    col4.markdown("**Exhaust Temp (°C)**")
+    
+    verified_data = []
+    
+    for i, row in enumerate(raw_data):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"<div style='padding-top: 10px;'><b>CYL {row['id']}</b></div>", unsafe_allow_html=True)
+        p_max_val = c2.number_input("pmax", value=float(row['p_max']), key=f"pmax_{i}", label_visibility="collapsed")
+        p_comp_val = c3.number_input("pcomp", value=float(row['p_comp']), key=f"pcomp_{i}", label_visibility="collapsed")
+        exh_val = c4.number_input("exh", value=float(row['exhaust_temp']), key=f"exh_{i}", label_visibility="collapsed")
+        
+        verified_data.append({
+            "id": row['id'],
+            "p_max": p_max_val,
+            "p_comp": p_comp_val,
+            "exhaust_temp": exh_val
+        })
 
-    # 3. Execution Gate
-    if st.button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary"):
+    # --- EXECUTION GATE ---
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary", use_container_width=True):
         try:
-            # Validate through Pydantic to ensure the user didn't enter physically impossible numbers
-            valid_cylinders = [Cylinder(**row) for row in edited_df.to_dict('records')]
+            valid_cylinders = [Cylinder(**row) for row in verified_data]
             final_df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
             
             st.markdown("---")
             
-            # --- RENDER DASHBOARD ---
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Engine Load Index", "87 RPM", "Ballast Condition")
             m2.metric("Mean Pmax", f"{final_df['p_max'].mean():.1f} bar")
@@ -168,5 +168,5 @@ if uploaded_file:
                         </div>
                         """, unsafe_allow_html=True)
                         
-        except ValidationError as e:
-            st.error("CRITICAL: Data Integrity Failure. A value entered in the grid violates thermodynamic limits (e.g., Pcomp > Pmax or zero values). Please correct the table.")
+        except ValidationError:
+            st.error("CRITICAL: Data Integrity Failure. A value entered in the grid violates thermodynamic limits. Please correct the table.")
