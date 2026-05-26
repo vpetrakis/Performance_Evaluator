@@ -4,4 +4,3 @@ pydantic
 plotly
 numpy
 olefile
-openai
