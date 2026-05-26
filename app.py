@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from pydantic import BaseModel, Field, ValidationError
 import olefile
-import re
 from io import BytesIO
 
 # --- UI CONFIGURATION ---
@@ -32,33 +31,52 @@ class Cylinder(BaseModel):
     def combustion_ratio(self) -> float:
         return self.p_max / self.p_comp
 
-# --- PURE PYTHON HEURISTIC PARSER ---
+# --- NEW: THE TEC-005 CELL PARSER ---
 def extract_raw_binary(file_bytes):
+    """Reads the raw OLE stream from the legacy .doc file."""
     ole = olefile.OleFileIO(BytesIO(file_bytes))
     if ole.exists('WordDocument'):
         return ole.openstream('WordDocument').read().decode('ascii', errors='ignore')
     return ""
 
-def heuristic_decoder(raw_text):
+def parse_tec_005_cells(raw_text):
     """
-    UPGRADE 2: SAFE DEFAULTS.
-    If the parser is confused by the broken binary, it injects safe, physically 
-    possible numbers instead of 0.0 to prevent instant Pydantic crashes.
+    Uses the \x07 (Bell) character to split the Word document into exact table cells.
+    Preserves blank cells to prevent the data from shifting left.
     """
-    all_numbers = [float(x) for x in re.findall(r'\b\d{2,3}(?:\.\d+)?\b', raw_text)]
-    cylinders = []
+    # Split the raw text exactly at the hidden table cell walls
+    cells = [c.strip() for c in raw_text.split('\x07')]
     
-    p_comp_candidates = [n for n in all_numbers if 45 <= n <= 68]
-    p_max_candidates = [n for n in all_numbers if 69 <= n <= 140]
-    exh_candidates = [n for n in all_numbers if 280 <= n <= 450]
+    # Initialize with safe, neutral baselines to prevent instant Pydantic crashes
+    cylinders = [{"id": i, "p_max": 100.0, "p_comp": 80.0, "exhaust_temp": 350.0} for i in range(1, 7)]
     
-    for i in range(1, 7):
-        cylinders.append({
-            "id": i,
-            "p_max": p_max_candidates[i-1] if len(p_max_candidates) >= i else 100.0, 
-            "p_comp": p_comp_candidates[i-1] if len(p_comp_candidates) >= i else 80.0,  
-            "exhaust_temp": exh_candidates[i-1] if len(exh_candidates) >= i else 350.0, 
-        })
+    all_candidates = []
+    
+    # Extract numbers, explicitly turning blank cells into 0.0 to lock the grid in place
+    for c in cells:
+        if c == '':
+            all_candidates.append(0.0) 
+        else:
+            try:
+                all_candidates.append(float(c))
+            except ValueError:
+                pass # Ignore text labels like "Pi bar" or "Exhaust"
+                
+    # Filter numbers into their thermal buckets, keeping the 0.0 placeholders
+    p_comp_candidates = [n for n in all_candidates if (45 <= n <= 95) or n == 0.0]
+    p_max_candidates = [n for n in all_candidates if (96 <= n <= 150) or n == 0.0]
+    exh_candidates = [n for n in all_candidates if (280 <= n <= 450) or n == 0.0]
+
+    # Map the isolated numbers to the cylinders. 
+    # If a cell was blank (0.0), it leaves the safe baseline in place so the app doesn't crash.
+    for i in range(6):
+        if i < len(p_max_candidates) and p_max_candidates[i] != 0.0:
+            cylinders[i]['p_max'] = p_max_candidates[i]
+        if i < len(p_comp_candidates) and p_comp_candidates[i] != 0.0:
+            cylinders[i]['p_comp'] = p_comp_candidates[i]
+        if i < len(exh_candidates) and exh_candidates[i] != 0.0:
+            cylinders[i]['exhaust_temp'] = exh_candidates[i]
+            
     return cylinders
 
 # --- ELITE DIAGNOSTICS ENGINE ---
@@ -108,19 +126,19 @@ st.markdown("### Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 uploaded_file = st.file_uploader("Initiate Data Uplink (.doc)", type=["doc"])
 
 if uploaded_file:
-    # UPGRADE 1: SESSION STATE MEMORY
-    # This prevents Streamlit from wiping the user's manual edits when they click "Execute"
+    # 1. SESSION STATE MEMORY (Prevents the UI from wiping your inputs)
     if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
         raw_text = extract_raw_binary(uploaded_file.read())
-        st.session_state.guessed_data = heuristic_decoder(raw_text)
+        st.session_state.guessed_data = parse_tec_005_cells(raw_text)
         st.session_state.current_file = uploaded_file.name
 
     st.markdown("---")
     st.markdown("### ⚠️ DATA INTEGRITY VERIFICATION")
-    st.info("Legacy `.doc` formatting detected. Please verify and correct any shifted values below before executing.")
+    st.info("Legacy `.doc` formatting detected. The system has extracted the following parameters using strict cell boundaries. Please verify before executing.")
     
     verified_data = []
     
+    # 2. THE UNBREAKABLE VERTICAL UI
     with st.form("verification_form"):
         for row in st.session_state.guessed_data:
             st.markdown(f"<div class='cyl-block'><b>CYLINDER {row['id']}</b></div>", unsafe_allow_html=True)
@@ -138,22 +156,20 @@ if uploaded_file:
             })
             st.markdown("<br>", unsafe_allow_html=True)
 
-        # Execution Gate
+        # 3. EXECUTION GATE
         submitted = st.form_submit_button("🚀 EXECUTE THERMODYNAMIC ANALYSIS", type="primary", use_container_width=True)
 
     if submitted:
-        # UPGRADE 3: GRANULAR ERROR TRACKING
+        # 4. GRANULAR ERROR TRACKING
         errors = []
         valid_cylinders = []
         
         for data in verified_data:
             try:
-                # Custom logical check to prevent Pcomp from being higher than Pmax
                 if data['p_comp'] >= data['p_max']:
                     errors.append(f"Cylinder {data['id']}: Pcomp ({data['p_comp']} bar) cannot be equal to or higher than Pmax ({data['p_max']} bar).")
                     continue
                 
-                # Run through the Pydantic shield
                 cyl = Cylinder(**data)
                 valid_cylinders.append(cyl)
                 
@@ -162,13 +178,11 @@ if uploaded_file:
                     field = err['loc'][0]
                     errors.append(f"Cylinder {data['id']} [{field}]: Value is outside physical engine limits.")
         
-        # If any errors were caught, display them clearly and stop the analysis.
         if errors:
             st.error("🚨 **DATA INTEGRITY FAILURE:** Please correct the following errors in the grid above:")
             for error in errors:
                 st.markdown(f"- {error}")
         else:
-            # If the data is clean, run the engine.
             final_df = pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
             
             st.markdown("---")
