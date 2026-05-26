@@ -5,7 +5,6 @@ from pydantic import BaseModel, Field, ValidationError
 import olefile
 from io import BytesIO
 import json
-import os
 from openai import OpenAI
 
 # --- UI CONFIGURATION ---
@@ -51,20 +50,21 @@ class Cylinder(BaseModel):
 
 # --- UPGRADE 2: AI DATA PIPELINE ---
 def extract_raw_binary(file_bytes):
-    """Pulls the shattered binary text to feed to the AI."""
+    """Pulls the shattered binary text from the legacy .doc using pure Python."""
     ole = olefile.OleFileIO(BytesIO(file_bytes))
     if ole.exists('WordDocument'):
         return ole.openstream('WordDocument').read().decode('ascii', errors='ignore')
-    raise ValueError("Invalid Document Structure")
+    raise ValueError("Invalid Document Structure: Cannot read OLE stream.")
 
 def ai_heuristic_extraction(raw_text: str) -> pd.DataFrame:
     """
     Sends the shattered text to an LLM to logically reconstruct the grid, 
     bypassing the 'invisible shift' bug entirely.
     """
-    api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
-    if not api_key:
-        st.error("API Key missing. Add OPENAI_API_KEY to your environment secrets.")
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except KeyError:
+        st.error("🚨 API Key Missing! Please add OPENAI_API_KEY to your Streamlit Secrets.")
         st.stop()
         
     client = OpenAI(api_key=api_key)
@@ -72,10 +72,11 @@ def ai_heuristic_extraction(raw_text: str) -> pd.DataFrame:
     prompt = f"""
     You are a marine engineer. Read this corrupted text stream from a MAN-B&W 5S60MC-C engine log.
     Reconstruct the thermodynamic parameters for Cylinders 1 through 6. 
-    Account for missing or blank rows (e.g., Pi bar is often left blank).
+    Account for missing or blank rows (e.g., Pi bar is often left blank, so numbers shift).
     Normal ranges: Pcomp (45-70), Pmax (70-150), Exhaust Temp (280-450).
     
-    Return ONLY a raw JSON array of objects with keys: id, p_max, p_comp, exhaust_temp.
+    Return ONLY a raw JSON array of 6 objects with exact keys: id, p_max, p_comp, exhaust_temp.
+    Do not include markdown blocks or any other text.
     
     Raw Text:
     {raw_text[:2000]} 
@@ -87,17 +88,16 @@ def ai_heuristic_extraction(raw_text: str) -> pd.DataFrame:
         response_format={"type": "json_object"} # Forces perfect JSON output
     )
     
-    # Parse the AI's JSON output directly into Pydantic models for strict validation
     try:
         response_content = response.choices[0].message.content
-        # Ensure it's a valid dictionary with a list inside, or just a list
         parsed_json = json.loads(response_content)
+        # Handle cases where the AI wraps the array in a parent object
         data_list = parsed_json if isinstance(parsed_json, list) else list(parsed_json.values())[0]
         
         valid_cylinders = [Cylinder(**row) for row in data_list]
         return pd.DataFrame([{**cyl.model_dump(), "ratio": cyl.combustion_ratio} for cyl in valid_cylinders])
     except Exception as e:
-        raise ValueError(f"AI Reconstruction Failed: {e}")
+        raise ValueError(f"AI Reconstruction Failed to parse valid thermodynamics. Detail: {e}")
 
 # --- ELITE DIAGNOSTICS ENGINE ---
 def run_dynamic_diagnostics(df: pd.DataFrame, rpm: float):
@@ -162,12 +162,11 @@ with st.sidebar:
     st.metric("Target Pmax", f"{targets['pmax_target']} bar")
     st.metric("Target Pcomp", f"{targets['pcomp_target']} bar")
 
-uploaded_file = st.file_uploader("Initiate Data Uplink (.doc / .docx)", type=["doc", "docx"])
+uploaded_file = st.file_uploader("Initiate Data Uplink (.doc)", type=["doc"])
 
 if uploaded_file:
-    with st.spinner("Executing AI Data Reconstruction..."):
+    with st.spinner("Executing AI Data Reconstruction & Thermodynamic Analysis..."):
         try:
-            # Pipeline: Read Binary -> Extract Gibberish -> AI Reconstruction -> Validated DataFrame
             raw_text = extract_raw_binary(uploaded_file.read())
             final_df = ai_heuristic_extraction(raw_text)
             
@@ -200,5 +199,8 @@ if uploaded_file:
                         </div>
                         """, unsafe_allow_html=True)
                         
+            with st.expander("VIEW AI-RECONSTRUCTED THERMODYNAMIC MATRIX", expanded=False):
+                st.dataframe(final_df, use_container_width=True, hide_index=True)
+                        
         except Exception as e:
-            st.error(f"CRITICAL: Pipeline Failure. Detail: {str(e)}")
+            st.error(f"CRITICAL: Pipeline Failure. {str(e)}")
