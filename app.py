@@ -154,7 +154,15 @@ st.markdown("### ⚓ Vessel: M/V ALEXIS | Engine: MAN-B&W 5S60MC-C MK8")
 uploaded_file = st.file_uploader("INITIATE SECURE DATA UPLINK (.doc)", type=["doc"])
 
 if uploaded_file:
+    # --- SMART MEMORY FLUSH ---
+    # Checks if it's a new file OR if the old 'exhaust_temp' is stuck in memory
+    needs_update = False
     if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
+        needs_update = True
+    elif "guessed_data" in st.session_state and len(st.session_state.guessed_data) > 0 and "fuel_index" not in st.session_state.guessed_data[0]:
+        needs_update = True 
+
+    if needs_update:
         raw_text = extract_raw_binary(uploaded_file.read())
         st.session_state.guessed_data = parse_tec_005_cells(raw_text)
         st.session_state.current_file = uploaded_file.name
