@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# M.E. COMMAND CENTER v2.1  —  Maritime Engineering Performance Dashboard
-# Fleet-Adaptive Version | Dynamic Cylinder Scaling & Semantic Parsing
+# M.E. COMMAND CENTER v3.0  —  Maritime Engineering Performance Dashboard
+# Fleet-Adaptive Version | Semantic Label Scanner & Graceful Fails
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -152,6 +152,18 @@ div[data-testid="stDataFrame"] {
 }
 .conf-bar { height: 5px; background: rgba(255,255,255,0.07); border-radius: 3px; overflow: hidden; margin-top: 5px; }
 .conf-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #1d4ed8, #38b6ff); }
+
+/* Missing Data Alert Pulse */
+@keyframes pulse-border {
+  0% { border-color: rgba(245, 158, 11, 0.4); box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4); }
+  70% { border-color: rgba(245, 158, 11, 1); box-shadow: 0 0 0 10px rgba(245, 158, 11, 0); }
+  100% { border-color: rgba(245, 158, 11, 0.4); box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+}
+.missing-data-alert {
+    border: 2px solid #f59e0b !important;
+    animation: pulse-border 2s infinite;
+    background: rgba(245, 158, 11, 0.05) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -168,7 +180,7 @@ class Cylinder(BaseModel):
         return round(self.p_max / self.p_comp, 3)
 
 
-# ── CORE PARSER (UPDATED: DYNAMIC FLEET SCALING) ───────────────────────────────
+# ── CORE PARSER (V3: FLEET-ADAPTIVE SEMANTIC SCANNER) ──────────────────────────
 def parse_tec_005(file_bytes: bytes) -> dict:
     ole = olefile.OleFileIO(BytesIO(file_bytes))
     raw = ole.openstream("WordDocument").read()
@@ -252,7 +264,7 @@ def parse_tec_005(file_bytes: bytes) -> dict:
             break
 
     # ── DYNAMIC CYLINDER SIZING ──
-    # Reads the leading number from engine type (e.g., 7S50MC-C -> 7)
+    # Nameplate Auto-Scaler: Extracts actual engine size (e.g., 7S50MC-C -> 7)
     m = re.search(r"(\d+)[SsLl]", str(result.get("engine_type", "5S")))
     n_cyl = int(m.group(1)) if m else 5
     result["n_cylinders"] = n_cyl
@@ -279,7 +291,7 @@ def parse_tec_005(file_bytes: bytes) -> dict:
     result["tc_rpm"] = get_op("T/CRPM", 25)
     result["scav_pressure"] = get_op("Scavenge air pressure", 15)
 
-    # ── DYNAMIC CYLINDER BLOCK EXTRACTION ──
+    # ── SEMANTIC HORIZONTAL SWEEPER (GRID-AGNOSTIC) ──
     pmax_vals, pcomp_vals, fuel_vals = [], [], []
     
     def extract_block(anchor_label):
@@ -287,59 +299,56 @@ def parse_tec_005(file_bytes: bytes) -> dict:
             if anchor_label.lower() in str(cells[i]).lower():
                 block = []
                 started = False
-                for j in range(1, 100):
+                for j in range(1, 150):
                     if i + j >= len(cells): break
                     c = cells[i + j].strip()
-                    if "average" in c.lower(): 
-                        break  # Stop if we hit the averages line
+                    if "average" in c.lower(): break  # Document averages signal end of grid
                     
                     v = to_float(c)
                     if not started:
-                        # Must be a Pmax candidate (>60 bar) to initiate the block
-                        if v is not None and 60.0 <= v <= 200.0:
+                        # Ignition rule: Grid block starts with the first valid Pmax (>50 bar)
+                        if v is not None and 50.0 <= v <= 200.0:
                             block.append(v)
                             started = True
                     else:
-                        # Once started, collect valid floats or blanks (0.0)
-                        if v is not None and v > 20.0:
+                        # Sweep next 8 sequential cells, assigning 0.0 to blank/omitted fields
+                        if c == "" or c.lower() == "n/a":
+                            block.append(0.0)
+                        elif v is not None:
                             block.append(v)
-                        elif c == "":
+                        else:
                             block.append(0.0)
                             
                     if len(block) == 9: # 3 Pmax, 3 Pcomp, 3 Fuel
                         return block
         return []
 
-    # Semantic extraction of 3-cylinder blocks
-    b1 = extract_block("Wave height") # Block 1-3
-    b2 = extract_block("effective")   # Block 4-6
-    b3 = extract_block("g/BHPh")      # Block 7-9
-    b4 = extract_block("Auxil blowers") # Scalability for 10-12
+    # Targeting anchor headers that precede blocks of 3 cylinders
+    b1 = extract_block("Wave height")   # Cylinders 1-3
+    b2 = extract_block("effective")     # Cylinders 4-6
+    b3 = extract_block("g/BHPh")        # Cylinders 7-9
+    b4 = extract_block("Auxil blowers") # Cylinders 10-12
 
     for b in filter(lambda x: len(x) == 9, [b1, b2, b3, b4]):
         pmax_vals.extend(b[0:3])
         pcomp_vals.extend(b[3:6])
         fuel_vals.extend(b[6:9])
 
-    # ── DYNAMIC EXHAUST EXTRACTION ──
+    # ── DYNAMIC EXHAUST SCANNER ──
     exh_vals = []
-    started_exh = False
     for i in range(len(cells)):
-        if "Exhaust gas temp" in str(cells[i]):
-            for j in range(1, 250):
+        if "exhaust gas temp" in str(cells[i]).lower():
+            for j in range(1, 200):
                 if i + j >= len(cells): break
                 c = cells[i + j].strip()
-                if "Special points" in c or "Average" in c: 
-                    break
+                if "average" in c.lower() or "special points" in c.lower(): break
                 v = to_float(c)
-                if v is not None and 200.0 <= v <= 600.0:
+                # Filter strictly by typical exhaust temp ranges
+                if v is not None and 200.0 <= v <= 650.0:
                     exh_vals.append(v)
-                    started_exh = True
-                elif started_exh and c == "":
-                    exh_vals.append(0.0)
             break
 
-    # Assemble Matrix Safely
+    # Assemble Final Array, padding with 0.0s for entirely missing blocks
     for i in range(n_cyl):
         result["cylinders"].append({
             "id": i + 1,
@@ -714,7 +723,7 @@ def main():
     <p class="ve-sub">Maritime Engineering Performance Dashboard &nbsp;·&nbsp; TEC-005 Analysis Suite</p>
   </div>
   <div style="text-align:right;">
-    <span class="badge bi">v2.1</span>&nbsp;
+    <span class="badge bi">v3.0</span>&nbsp;
     <span class="badge bi">{date_str or 'Awaiting Data'}</span>
   </div>
 </div>
@@ -748,25 +757,39 @@ def main():
         elif conf >= 95.0:
             st.info(f"ℹ️  **Data Extracted** — {conf:.1f}% confidence. Verify highlighted fields.")
         else:
-            st.warning(f"⚠️  **Low Confidence ({conf:.1f}%)** — Manual verification required for all fields.")
+            st.warning(f"⚠️  **Low Confidence ({conf:.1f}%)** — Verification required for all fields.")
 
         st.markdown("---")
 
-        # ── VERIFICATION FORM ──
+        # ── VERIFICATION FORM (WITH GRACEFUL FAIL ALERTS) ──
         st.markdown("### 🔍 Data Integrity Verification")
         st.caption("Extracted values are pre-filled. Correct any discrepancies before executing analysis.")
 
         verified_rows = []
         with st.form("verify_form"):
             for cyl in data["cylinders"]:
-                with st.expander(
-                    f"Cylinder {cyl['id']}  ·  "
-                    f"Pmax: {cyl['p_max']:.0f} bar  ·  "
-                    f"Pcomp: {cyl['p_comp']:.0f} bar  ·  "
-                    f"Fuel: {cyl['fuel_index']:.0f}  ·  "
-                    f"Exh: {cyl['exhaust_temp']:.0f}°C",
-                    expanded=True,
-                ):
+                
+                # Check if data is completely missing to trigger the glowing UI warning
+                is_missing = cyl['p_max'] == 0.0 or cyl['p_comp'] == 0.0
+                
+                # Dynamic expander title based on missing data
+                if is_missing:
+                    expander_title = f"⚠️ CYLINDER {cyl['id']} MISSING - PLEASE INPUT MANUALLY"
+                else:
+                    expander_title = (
+                        f"Cylinder {cyl['id']}  ·  "
+                        f"Pmax: {cyl['p_max']:.0f} bar  ·  "
+                        f"Pcomp: {cyl['p_comp']:.0f} bar  ·  "
+                        f"Fuel: {cyl['fuel_index']:.0f}  ·  "
+                        f"Exh: {cyl['exhaust_temp']:.0f}°C"
+                    )
+
+                # Inject HTML to trigger the CSS pulse animation if missing
+                pulse_class = 'class="missing-data-alert"' if is_missing else ''
+                if is_missing:
+                    st.markdown(f'<div {pulse_class} style="padding: 10px; border-radius: 8px; margin-bottom: -15px; z-index: 10;"></div>', unsafe_allow_html=True)
+                
+                with st.expander(expander_title, expanded=is_missing):
                     c1, c2, c3, c4 = st.columns(4)
                     pm = c1.number_input("Pmax (bar)",    value=float(cyl["p_max"]),
                                          key=f"pm_{cyl['id']}", min_value=0.0, format="%.1f")
@@ -790,17 +813,18 @@ def main():
             errors = []
             valid_cyls = []
             for row in verified_rows:
-                # If a cylinder was genuinely left blank by the crew (0.0), flag it for the user
+                # The Data Integrity Shield prevents execution if the user ignored the blank cells
                 if row["p_max"] == 0.0 or row["p_comp"] == 0.0:
-                    errors.append(f"Cyl {row['id']}: Missing data (0.0 bar). Please input the required values.")
+                    errors.append(f"Cylinder {row['id']}: Missing data (0.0 bar). Please input the required values manually.")
                     continue
                 
                 if row["p_comp"] >= row["p_max"]:
                     errors.append(
-                        f"Cyl {row['id']}: Pcomp ({row['p_comp']:.1f}) ≥ Pmax ({row['p_max']:.1f}) — "
+                        f"Cylinder {row['id']}: Pcomp ({row['p_comp']:.1f}) ≥ Pmax ({row['p_max']:.1f}) — "
                         "physically impossible."
                     )
                     continue
+                
                 try:
                     cyl_obj = Cylinder(
                         id=row["id"], p_max=row["p_max"],
