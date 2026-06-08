@@ -1,7 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# M.E. COMMAND CENTER v2.0  —  Maritime Engineering Performance Dashboard
-# M/V ALEXIS  |  MAN-B&W 5S60MC-C MK8
-# Author: Chief Systems Engineer  |  Anchor-based parser with cross-validation
+# M.E. COMMAND CENTER v2.1  —  Maritime Engineering Performance Dashboard
+# Fleet-Adaptive Version | Dynamic Cylinder Scaling & Semantic Parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -12,7 +11,6 @@ from pydantic import BaseModel, Field, ValidationError
 import olefile
 from io import BytesIO
 import re
-import math
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -170,12 +168,8 @@ class Cylinder(BaseModel):
         return round(self.p_max / self.p_comp, 3)
 
 
-# ── CORE PARSER ────────────────────────────────────────────────────────────────
+# ── CORE PARSER (UPDATED: DYNAMIC FLEET SCALING) ───────────────────────────────
 def parse_tec_005(file_bytes: bytes) -> dict:
-    """
-    Anchor-based, cross-validated parser for MAN-B&W TEC-005 data sheets.
-    Guaranteed extraction with integrity check against document-embedded averages.
-    """
     ole = olefile.OleFileIO(BytesIO(file_bytes))
     raw = ole.openstream("WordDocument").read()
     cell_bytes_list = raw.split(b"\x07")
@@ -183,7 +177,6 @@ def parse_tec_005(file_bytes: bytes) -> dict:
     def decode_cell(cb: bytes) -> str:
         null_ratio = cb.count(b"\x00") / max(len(cb), 1)
         if null_ratio > 0.25 and len(cb) > 2:
-            # UTF-16-LE: strip null bytes from ASCII decode to get digits
             cleaned = cb.decode("ascii", errors="ignore").replace("\x00", "").strip()
             if cleaned:
                 return cleaned
@@ -218,7 +211,7 @@ def parse_tec_005(file_bytes: bytes) -> dict:
         "n_cylinders": 5,
     }
 
-    # ── Metadata ──
+    # ── Metadata Extraction ──
     label_map = {
         "M/V:": ("vessel", None), "Engine type:": ("engine_type", None),
         "Date:": ("date", None), "Builder:": ("builder", None),
@@ -233,108 +226,144 @@ def parse_tec_005(file_bytes: bytes) -> dict:
             result[key] = (converter(nxt) if converter else nxt) or result[key]
         elif c == "BHP:":
             v = to_float(safe_get(i + 1))
-            if v:
-                result["bhp"] = v
+            if v: result["bhp"] = v
         elif c == "Sulphur %:":
             v = to_float(safe_get(i + 1))
-            if v:
-                result["fuel_sulphur"] = v
+            if v: result["fuel_sulphur"] = v
         elif c == "Density at 15 C:":
             v = to_float(safe_get(i + 1))
-            if v:
-                result["fuel_density"] = v
+            if v: result["fuel_density"] = v
         elif c == "Maker:" and 34 <= i <= 42:
             result["tc_maker"] = safe_get(i + 1)
         elif c == "Max RPM:" and 48 <= i <= 55:
             v = to_float(safe_get(i + 1))
-            if v:
-                result["tc_max_rpm"] = v
+            if v: result["tc_max_rpm"] = v
         elif c == "Cylinder constant (HP, bar):" and i < 50:
             v = to_float(safe_get(i + 1))
-            if v:
-                result["cyl_constant"] = v
+            if v: result["cyl_constant"] = v
 
-    # Engine No (cell with 'No:' between idx 20-30)
     for i, c in enumerate(cells):
         if c.strip() == "No:" and 18 <= i <= 30:
             result["engine_no"] = safe_get(i + 1)
             break
-
-    # TC Type (cell with 'Type:' between idx 40-50)
     for i, c in enumerate(cells):
         if c.strip() == "Type:" and 40 <= i <= 52:
             result["tc_type"] = safe_get(i + 1)
             break
 
-    # ── Find 'P max bar' anchor ──
-    pi = 109  # Default known position
-    for i, c in enumerate(cells):
-        if c.strip() == "P max bar":
-            pi = i
-            break
-
-    # ── Operational data (fixed offsets from anchor) ──
-    ops = {
-        "rpm":             116 - 109,
-        "run_hours":       115 - 109,
-        "draught_fore":    114 - 109,
-        "draught_aft":     144 - 109,
-        "load_pct":        180 - 109,
-        "governor_index":  145 - 109,
-        "speed_log":       181 - 109,
-        "speed_obs":       216 - 109,
-        "barometer":       215 - 109,
-        "tc_rpm":          308 - 109,
-        "scav_pressure":   310 - 109,
-    }
-    for key, offset in ops.items():
-        v = to_float(safe_get(pi + offset))
-        if v is not None:
-            result[key] = v
-
-    # ── Document-embedded averages (cross-validation anchors) ──
-    result["avg_pmax_doc"]    = to_float(safe_get(pi + 127)) or 0.0  # cell 236
-    result["avg_pcomp_doc"]   = to_float(safe_get(pi + 129)) or 0.0  # cell 238
-    result["avg_fuel_doc"]    = to_float(safe_get(pi + 131)) or 0.0  # cell 240
-    result["avg_exhaust_doc"] = to_float(safe_get(pi + 285)) or 0.0  # cell 394
-
-    # ── Cylinder count from engine type string ──
-    m = re.match(r"(\d+)[Ss]", result["engine_type"])
+    # ── DYNAMIC CYLINDER SIZING ──
+    # Reads the leading number from engine type (e.g., 7S50MC-C -> 7)
+    m = re.search(r"(\d+)[SsLl]", str(result.get("engine_type", "5S")))
     n_cyl = int(m.group(1)) if m else 5
     result["n_cylinders"] = n_cyl
 
-    # ── Cylinder data extraction ──
-    # Block 1: cylinders 1-3 at offset +43 from anchor (cells 152-160)
-    b1 = pi + 43
-    # Block 2: cylinders 4-6 at offset +79 (cells 188-196, blanks at +2,+5,+8 for 6th cyl)
-    b2 = pi + 79
-    # Exhaust block 1: cells 301-303 at offset +192
-    e1 = pi + 192
-    # Exhaust block 2: cells 339-340 at offset +230
-    e2 = pi + 230
+    # ── SEMANTIC OPERATIONAL SCANNER ──
+    def get_op(label: str, lookahead: int = 15) -> float:
+        for i in range(len(cells)):
+            if label.lower() in str(cells[i]).lower():
+                for j in range(1, lookahead + 1):
+                    if i + j < len(cells):
+                        v = to_float(cells[i + j])
+                        if v is not None: return v
+        return 0.0
 
-    pmax_vals  = [to_float(safe_get(b1 + i)) or 0.0 for i in range(3)]
-    pcomp_vals = [to_float(safe_get(b1 + 3 + i)) or 0.0 for i in range(3)]
-    fuel_vals  = [to_float(safe_get(b1 + 6 + i)) or 0.0 for i in range(3)]
-    exh_vals   = [to_float(safe_get(e1 + i)) or 0.0 for i in range(3)]
+    result["rpm"] = get_op("r/min", 5) or get_op("RPM", 12)
+    result["run_hours"] = get_op("Total run. Hrs", 10)
+    result["draught_fore"] = get_op("Draught fore", 8)
+    result["draught_aft"] = get_op("Draught aft", 8)
+    result["load_pct"] = get_op("Load %", 12)
+    result["governor_index"] = get_op("Governor index", 10)
+    result["speed_log"] = get_op("Log knots", 8)
+    result["speed_obs"] = get_op("Obs knots", 8)
+    result["barometer"] = get_op("Barom", 8)
+    result["tc_rpm"] = get_op("T/CRPM", 25)
+    result["scav_pressure"] = get_op("Scavenge air pressure", 15)
 
-    # Second block: [pmax4, pmax5, BLANK, pcomp4, pcomp5, BLANK, fuel4, fuel5, BLANK]
-    for offset in [0, 1]:
-        pmax_vals.append(to_float(safe_get(b2 + offset)) or 0.0)
-        pcomp_vals.append(to_float(safe_get(b2 + 3 + offset)) or 0.0)
-        fuel_vals.append(to_float(safe_get(b2 + 6 + offset)) or 0.0)
-        exh_vals.append(to_float(safe_get(e2 + offset)) or 0.0)
+    # ── DYNAMIC CYLINDER BLOCK EXTRACTION ──
+    pmax_vals, pcomp_vals, fuel_vals = [], [], []
+    
+    def extract_block(anchor_label):
+        for i in range(len(cells)):
+            if anchor_label.lower() in str(cells[i]).lower():
+                block = []
+                started = False
+                for j in range(1, 100):
+                    if i + j >= len(cells): break
+                    c = cells[i + j].strip()
+                    if "average" in c.lower(): 
+                        break  # Stop if we hit the averages line
+                    
+                    v = to_float(c)
+                    if not started:
+                        # Must be a Pmax candidate (>60 bar) to initiate the block
+                        if v is not None and 60.0 <= v <= 200.0:
+                            block.append(v)
+                            started = True
+                    else:
+                        # Once started, collect valid floats or blanks (0.0)
+                        if v is not None and v > 20.0:
+                            block.append(v)
+                        elif c == "":
+                            block.append(0.0)
+                            
+                    if len(block) == 9: # 3 Pmax, 3 Pcomp, 3 Fuel
+                        return block
+        return []
 
+    # Semantic extraction of 3-cylinder blocks
+    b1 = extract_block("Wave height") # Block 1-3
+    b2 = extract_block("effective")   # Block 4-6
+    b3 = extract_block("g/BHPh")      # Block 7-9
+    b4 = extract_block("Auxil blowers") # Scalability for 10-12
+
+    for b in filter(lambda x: len(x) == 9, [b1, b2, b3, b4]):
+        pmax_vals.extend(b[0:3])
+        pcomp_vals.extend(b[3:6])
+        fuel_vals.extend(b[6:9])
+
+    # ── DYNAMIC EXHAUST EXTRACTION ──
+    exh_vals = []
+    started_exh = False
+    for i in range(len(cells)):
+        if "Exhaust gas temp" in str(cells[i]):
+            for j in range(1, 250):
+                if i + j >= len(cells): break
+                c = cells[i + j].strip()
+                if "Special points" in c or "Average" in c: 
+                    break
+                v = to_float(c)
+                if v is not None and 200.0 <= v <= 600.0:
+                    exh_vals.append(v)
+                    started_exh = True
+                elif started_exh and c == "":
+                    exh_vals.append(0.0)
+            break
+
+    # Assemble Matrix Safely
     for i in range(n_cyl):
         result["cylinders"].append({
             "id": i + 1,
-            "p_max":       pmax_vals[i]  if i < len(pmax_vals)  else 0.0,
-            "p_comp":      pcomp_vals[i] if i < len(pcomp_vals) else 0.0,
-            "fuel_index":  fuel_vals[i]  if i < len(fuel_vals)  else 0.0,
-            "exhaust_temp": exh_vals[i]  if i < len(exh_vals)   else 0.0,
+            "p_max":        pmax_vals[i]  if i < len(pmax_vals)  else 0.0,
+            "p_comp":       pcomp_vals[i] if i < len(pcomp_vals) else 0.0,
+            "fuel_index":   fuel_vals[i]  if i < len(fuel_vals)  else 0.0,
+            "exhaust_temp": exh_vals[i]   if i < len(exh_vals)   else 0.0,
         })
 
-    # ── Cross-validation ──
+    # ── DOCUMENT AVERAGES & CROSS-VALIDATION ──
+    avg_cands = []
+    for i in range(len(cells)):
+        if "Average" in str(cells[i]):
+            for j in range(1, 4):
+                if i + j < len(cells):
+                    v = to_float(cells[i+j])
+                    if v is not None:
+                        avg_cands.append(v)
+                        break
+    
+    if len(avg_cands) >= 1: result["avg_pmax_doc"] = avg_cands[0]
+    if len(avg_cands) >= 2: result["avg_pcomp_doc"] = avg_cands[1]
+    if len(avg_cands) >= 3: result["avg_fuel_doc"] = avg_cands[2]
+
     valid = [c for c in result["cylinders"] if c["p_max"] > 0]
     if valid and result["avg_pmax_doc"] > 0:
         c_pmax  = sum(c["p_max"]       for c in valid) / len(valid)
@@ -474,7 +503,6 @@ def chart_thermodynamics(df: pd.DataFrame) -> go.Figure:
     )
     ids = df["id"].tolist()
 
-    # Optimal zone polygon
     lower = (df["p_comp"] * RATIO_LOW).tolist()
     upper = (df["p_comp"] * RATIO_HIGH).tolist()
     fig.add_trace(go.Scatter(
@@ -484,7 +512,6 @@ def chart_thermodynamics(df: pd.DataFrame) -> go.Figure:
         hoverinfo="skip",
     ), row=1, col=1)
 
-    # Pcomp
     fig.add_trace(go.Scatter(
         x=ids, y=df["p_comp"], name="P comp",
         mode="lines+markers",
@@ -493,7 +520,6 @@ def chart_thermodynamics(df: pd.DataFrame) -> go.Figure:
                     line=dict(color="white", width=1.5)),
     ), row=1, col=1)
 
-    # Pmax
     fig.add_trace(go.Scatter(
         x=ids, y=df["p_max"], name="P max",
         mode="lines+markers",
@@ -502,13 +528,11 @@ def chart_thermodynamics(df: pd.DataFrame) -> go.Figure:
                     line=dict(color="white", width=1.5)),
     ), row=1, col=1)
 
-    # Average Pmax line
     avg_pm = df["p_max"].mean()
     fig.add_hline(y=avg_pm, line=dict(color=BLUE, width=1, dash="dash"),
                   annotation_text=f"avg {avg_pm:.1f}", annotation_font=dict(color=BLUE, size=10),
                   row=1, col=1)
 
-    # Fuel index bars
     colors = [GREEN if 57 <= v <= 60 else AMBER for v in df["fuel_index"]]
     fig.add_trace(go.Bar(
         x=ids, y=df["fuel_index"], name="Fuel index",
@@ -690,7 +714,7 @@ def main():
     <p class="ve-sub">Maritime Engineering Performance Dashboard &nbsp;·&nbsp; TEC-005 Analysis Suite</p>
   </div>
   <div style="text-align:right;">
-    <span class="badge bi">v2.0</span>&nbsp;
+    <span class="badge bi">v2.1</span>&nbsp;
     <span class="badge bi">{date_str or 'Awaiting Data'}</span>
   </div>
 </div>
@@ -766,6 +790,11 @@ def main():
             errors = []
             valid_cyls = []
             for row in verified_rows:
+                # If a cylinder was genuinely left blank by the crew (0.0), flag it for the user
+                if row["p_max"] == 0.0 or row["p_comp"] == 0.0:
+                    errors.append(f"Cyl {row['id']}: Missing data (0.0 bar). Please input the required values.")
+                    continue
+                
                 if row["p_comp"] >= row["p_max"]:
                     errors.append(
                         f"Cyl {row['id']}: Pcomp ({row['p_comp']:.1f}) ≥ Pmax ({row['p_max']:.1f}) — "
@@ -979,6 +1008,5 @@ def main():
   </p>
 </div>
 """, unsafe_allow_html=True)
-
 
 main()
