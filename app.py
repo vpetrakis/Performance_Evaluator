@@ -318,10 +318,11 @@ def _expand(grpprl, data):
 
 class Row:
     """One table row: cells = [(x0, x1, text)] positioned in twips."""
-    __slots__ = ("cells", "degraded")
+    __slots__ = ("cells", "degraded", "idx")
 
     def __init__(self, cells, tdef):
         self.degraded = False
+        self.idx = -1
         xs = None
         if tdef and len(tdef) >= 1:
             n = tdef[0]
@@ -456,6 +457,8 @@ def _read_doc_grid(file_bytes):
         buf = []
     if not out_rows:
         raise ParseError("No table found in document")
+    for k, r in enumerate(out_rows):
+        r.idx = k
     return out_rows
 
 
@@ -589,10 +592,20 @@ def in_col(c, xa, xb):
     return ov >= 0.4 * min(c[1] - c[0], xb - xa) or xa <= _ctr(c) < xb
 
 
+_CLAIMS = {"s": None}          # set of (row, x0, x1) keys of cells the extractors have consumed
+
+
+def claim(row, c):
+    s = _CLAIMS["s"]
+    if s is not None and c is not None:
+        s.add((row.idx, c[0], c[1]))
+
+
 def find_cell(rows, i0, i1, rx, xa=-10 ** 9, xb=10 ** 9):
     for i in range(max(i0, 0), min(i1, len(rows))):
         for c in rows[i].cells:
             if re.search(rx, cl(c[2]), re.I) and xa <= _ctr(c) < xb:
+                claim(rows[i], c)
                 return i, c
     return None
 
@@ -602,6 +615,7 @@ def find_all(rows, i0, i1, rx, xa=-10 ** 9, xb=10 ** 9):
     for i in range(max(i0, 0), min(i1, len(rows))):
         for c in rows[i].cells:
             if re.search(rx, cl(c[2]), re.I) and xa <= _ctr(c) < xb:
+                claim(rows[i], c)
                 out.append((i, c))
     return out
 
@@ -612,6 +626,8 @@ def scan_below(rows, i, xa, xb, max_rows=5, comma="decimal"):
         for c in rows[j].cells:
             if cl(c[2]) and in_col(c, xa, xb):
                 v, kind = cell_value(c[2], comma)
+                if kind == "num":
+                    claim(rows[j], c)
                 return (v if kind == "num" else None), j
     return None, None
 
@@ -620,14 +636,15 @@ def numbered_values(rows, i0, i1, xa, xb, maxn=4):
     """Single-column readings numbered 1,2,.. (T/C 1, T/C 2): {n: value}."""
     seq = []
     for j in range(i0, min(i1, len(rows))):
-        for c in rows[j].cells:
-            if cl(c[2]) and in_col(c, xa, xb):
-                seq.append(cl(c[2]))
+        for cc in rows[j].cells:
+            if cl(cc[2]) and in_col(cc, xa, xb):
+                seq.append((rows[j], cc, cl(cc[2])))
     vals, cur, expect = {}, None, 1
-    for k, t in enumerate(seq):
-        nxt = seq[k + 1] if k + 1 < len(seq) else None
+    for k, (rw, cc, t) in enumerate(seq):
+        nxt = seq[k + 1][2] if k + 1 < len(seq) else None
         if t == str(expect) and expect <= maxn and (cur is None or cur in vals or nxt != str(expect)):
             cur, expect = expect, expect + 1
+            claim(rw, cc)
             continue
         mm = re.match(r"^%d\s+(\S.*)$" % expect, t) if expect <= maxn else None
         if mm:                                     # number and reading typed into the same cell ("1 359")
@@ -635,6 +652,7 @@ def numbered_values(rows, i0, i1, xa, xb, maxn=4):
             if kind == "num":
                 cur, expect = expect, expect + 1
                 vals.setdefault(cur, v)
+                claim(rw, cc)
                 continue
         v, kind = cell_value(t)
         if kind != "num":
@@ -642,6 +660,7 @@ def numbered_values(rows, i0, i1, xa, xb, maxn=4):
         if cur is None:
             cur, expect = 1, 2
         vals.setdefault(cur, v)
+        claim(rw, cc)
     return vals
 
 
@@ -680,6 +699,7 @@ def extract_trio(rows, r0, r1, xa, xb):
         end = nrows[k + 1][0] if k + 1 < len(nrows) else r1
         numcells = [(c[0], c[1], d) for c, d, _ in qual]
         for c, d, rest in qual:
+            claim(rows[i], c)
             out.setdefault(d, dict(value=None, src=None, row=i))
             if rest:
                 v, kind = cell_value(rest[0])
@@ -701,6 +721,7 @@ def extract_trio(rows, r0, r1, xa, xb):
                     if len(toks) == len(spanned):
                         for d, tv in zip(spanned, toks):
                             record(d, tv, "cell", j)
+                        claim(rows[j], c)
                     else:
                         issues.append(("warn", f"A merged cell covers cylinders {spanned} and cannot be split"))
                     continue
@@ -713,6 +734,7 @@ def extract_trio(rows, r0, r1, xa, xb):
                     issues.append(("info", f"Orphan value '{cl(c[2])[:12]}' not aligned to any cylinder"))
                     continue
                 record(best[2], v, "cell", j)
+                claim(rows[j], c)
     return out, issues, len(nrows)
 
 
@@ -726,6 +748,9 @@ def _avg_row(rows, i0, i1, xa=-10 ** 9, xb=10 ** 9):
 
 def _avg_value(row, xa, xb):
     """Document 'Average' value from cells in column range; returns (value, decimals) or (None, 0)."""
+    for c in row.cells:
+        if cl(c[2]) and xa <= _ctr(c) < xb:
+            claim(row, c)
     txt = " ".join(cl(c[2]) for c in row.cells if cl(c[2]) and xa <= _ctr(c) < xb)
     txt = re.sub(r"(?i)\b(ave(?:rage)?|avg|mean)\b\.?\s*[:=]?", " ", txt)
     m = _NUM_RE.search(txt)
@@ -742,7 +767,7 @@ def _avg_value(row, xa, xb):
 # ─────────────────────────────────────────────────────────────────────────────
 PLAUSIBLE = {  # key: (low, high)
     "p_max": (25, 220), "p_comp": (15, 190), "fuel_index": (5, 150), "exh_temp": (120, 650),
-    "pmax_adj": (0, 200), "cw_out": (30, 110), "piston_out": (25, 90),
+    "pmax_adj": (0, 200), "cw_out": (30, 110), "piston_out": (25, 90), "pi": (0.5, 60),
 }
 GROUPS = [("p_max", r"^p\s*[-.]?\s*max"), ("p_comp", r"^p\s*[-.]?\s*comp"),
           ("fuel_index", r"^(fuel\s*pump|fuel\s*index|f\.?\s*p\.?\s*i)")]
@@ -760,8 +785,9 @@ def parse_tec_005(file_bytes):
     """Parse a TEC-005 Main Engine Performance Data Sheet (.doc). Never raises for content problems;
     raises ParseError only if the file is not a readable Word binary document."""
     rows = read_doc_grid(file_bytes)
+    _CLAIMS["s"] = set()
     issues = []          # (severity, message)   severity: info | warn | error
-    res = dict(identity={}, op={}, cylinders=[], avgs_doc={}, avgs_calc={}, tc={}, singles={},
+    res = dict(identity={}, op={}, cylinders=[], avgs_doc={}, avgs_calc={}, tc={}, singles={}, header_extra={}, tc_info={}, remarks_series=[],
                remarks="", issues=issues, n_cylinders=0, status="failed", layout={})
 
     if any(r.degraded for r in rows):
@@ -785,6 +811,7 @@ def parse_tec_005(file_bytes):
         for c in rows[H].cells:
             if re.search(rx, cl(c[2]), re.I):
                 ranges[key] = (c[0], c[1])
+                claim(rows[H], c)
                 break
     structure_notes = 0
     if len(ranges) < 3:                               # fallback: chunk the first long numbering row into triplets
@@ -815,6 +842,19 @@ def parse_tec_005(file_bytes):
             v, dec = _avg_value(rows[A], xa, xb)
             if v is not None:
                 res["avgs_doc"][key] = (v, dec)
+
+    # ── Pi (mean indicated pressure) ──
+    for cc in rows[H].cells:
+        if re.match(r"(?i)^pi\b", cl(cc[2])):
+            claim(rows[H], cc)
+            got, iss, nn = extract_trio(rows, H + 1, perf_end, cc[0], cc[1])
+            per["pi"], nnum["pi"] = got, nn
+            issues.extend(i for i in iss if i[0] != "info")
+            if A is not None:
+                v, dec = _avg_value(rows[A], cc[0], cc[1])
+                if v is not None:
+                    res["avgs_doc"]["pi"] = (v, dec)
+            break
 
     # ── exhaust block ──
     exh_rng = adj_rng = None
@@ -863,9 +903,11 @@ def parse_tec_005(file_bytes):
 
     # ── header, operating conditions, T/C, singles, remarks (best effort, never fatal) ──
     for fn, label in ((lambda: _read_identity(rows, H, res), "Header fields"),
+                      (lambda: _harvest_header(rows, H, res), "Header details"),
                       (lambda: _read_operating(rows, H, perf_end, ranges, res), "Operating conditions"),
                       (lambda: _read_extras(rows, E_h, E_a, exh_rng, sp, S_a, res), "Turbocharger / auxiliary readings"),
-                      (lambda: _read_remarks(rows, res), "Remarks")):
+                      (lambda: _read_remarks(rows, res), "Remarks"),
+                      (lambda: _mine_remarks(res), "Remark values")):
         try:
             fn()
         except Exception as e:                                           # noqa: BLE001
@@ -884,7 +926,7 @@ def parse_tec_005(file_bytes):
         res["identity"]["date"] = None
 
     # ── assemble per-cylinder table & reconcile cylinder count ──
-    keys = ("p_max", "p_comp", "fuel_index", "exh_temp", "pmax_adj", "cw_out", "piston_out")
+    keys = ("p_max", "p_comp", "fuel_index", "exh_temp", "pmax_adj", "cw_out", "piston_out", "pi")
     n_data = 0
     for key in ("p_max", "p_comp", "fuel_index", "exh_temp"):
         for d, rec in per.get(key, {}).items():
@@ -957,6 +999,10 @@ def parse_tec_005(file_bytes):
     else:
         res["status"] = "ok"
     res["confidence"] = _confidence(res, ranges, nnum, A is not None, E_h is not None)
+    try:
+        _coverage(rows, res)
+    except Exception as e:                                                   # noqa: BLE001
+        issues.append(("info", f"Coverage audit unavailable ({type(e).__name__})"))
     return res
 
 
@@ -975,6 +1021,7 @@ def _is_label(t):
 def _label_value(rows, i, ci, below=True, max_below=1, rx=None):
     """Value belonging to label cell rows[i].cells[ci]: embedded in the cell / right neighbour / cell below."""
     c = rows[i].cells[ci]
+    claim(rows[i], c)
     txt = cl(c[2])
     rest = ""
     if rx:
@@ -987,12 +1034,14 @@ def _label_value(rows, i, ci, below=True, max_below=1, rx=None):
         nc = rows[i].cells[k]
         if cl(nc[2]):
             if not _is_label(nc[2]):
+                claim(rows[i], nc)
                 return cl(nc[2])
             break
     if below:
         for j in range(i + 1, min(i + 1 + max_below, len(rows))):
             for nc in rows[j].cells:
                 if cl(nc[2]) and in_col(nc, c[0], c[1]) and not _is_label(nc[2]):
+                    claim(rows[j], nc)
                     return cl(nc[2])
     return ""
 
@@ -1050,12 +1099,14 @@ def _read_identity(rows, H, res):
                 cands.append(("header", parse_date(raw) if raw else None))
     h_first = rows[H].cells[0] if rows[H].cells else None
     if h_first and re.match(r"(?i)^date\b", cl(h_first[2])):
+        claim(rows[H], h_first)
         cands.append(("table-head", parse_date(cl(h_first[2]))))
         for j in range(H + 1, H + 3):
             for c in rows[j].cells:
                 if cl(c[2]) and in_col(c, h_first[0], h_first[1]):
                     d = parse_date(c[2])
                     if d:
+                        claim(rows[j], c)
                         cands.append(("table-row", d))
     ident["_date_candidates"] = [(s, d) for s, d in cands if d]
 
@@ -1085,6 +1136,7 @@ def _read_operating(rows, H, end, ranges, res):
                 if not m or _ctr(c) >= xmax:
                     continue
                 found = True
+                claim(rows[i], c)
                 rest = t[m.end():].strip()
                 v = kind = None
                 if rest:
@@ -1101,6 +1153,7 @@ def _read_operating(rows, H, end, ranges, res):
                                     nv = to_num(nc[2], mode)
                                     if nv is not None and key in ("wind", "wave", "load_pct"):
                                         v = nv
+                                        claim(rows[j], nc)
                                     break
                             if v is not None:
                                 break
@@ -1109,21 +1162,36 @@ def _read_operating(rows, H, end, ranges, res):
                 break
             if found and key in op:
                 break
-    # wind / wave / swell directions are free text; keep for reference
+    # directions (first 'Direct' = wind, second = waves) and the hour of the test
     dirs = find_all(rows, H, end, r"^direct", -10 ** 9, xmax)
-    if dirs:
-        i, c = dirs[0]
-        t = cl(c[2])[6:].strip()
+    for n_, (i, cc) in enumerate(dirs[:2]):
+        t = cl(cc[2])[6:].strip()
         if not t:
             for j in range(i + 1, min(i + 3, len(rows))):
                 for nc in rows[j].cells:
-                    if cl(nc[2]) and in_col(nc, c[0], c[1]):
+                    if cl(nc[2]) and in_col(nc, cc[0], cc[1]):
                         t = "" if re.match(r"(?i)^direct", cl(nc[2])) else cl(nc[2])
+                        if t:
+                            claim(rows[j], nc)
+                        break
+                if t:
+                    break
+        if t and re.fullmatch(r"(?i)[NSEW]{1,3}(?:[\s/-]+[NSEW]{1,3})*|variable|calm|var\.?", t):
+            op["wind_dir" if n_ == 0 else "wave_dir"] = t
+    hr = find_cell(rows, H, end, r"^hour", -10 ** 9, xmax)
+    if hr:
+        t = cl(hr[1][2])[4:].strip(" :")
+        if not t:
+            for j in range(hr[0] + 1, min(hr[0] + 3, len(rows))):
+                for nc in rows[j].cells:
+                    if cl(nc[2]) and in_col(nc, hr[1][0], hr[1][1]):
+                        t = cl(nc[2])
+                        claim(rows[j], nc)
                         break
                 if t:
                     break
         if t:
-            op["wind_dir"] = t
+            op["hour"] = t
 
 
 def _read_extras(rows, E_h, E_a, exh_rng, sp, S_a, res):
@@ -1155,6 +1223,7 @@ def _read_extras(rows, E_h, E_a, exh_rng, sp, S_a, res):
             for j in range(i + 1, end):
                 for nc in rows[j].cells:
                     if cl(nc[2]) and in_col(nc, c[0], c[1]):
+                        claim(rows[j], nc)
                         t = cl(nc[2])
                         low = t.lower()
                         v, kind = cell_value(t)
@@ -1170,6 +1239,10 @@ def _read_extras(rows, E_h, E_a, exh_rng, sp, S_a, res):
                         elif "deg" in low or "temp" in low:
                             unit = "scav_temp"
                         break
+    for n_, d_ in tc.items():
+        if d_.get("tc_rpm") is not None and 0 < d_["tc_rpm"] < 100:
+            res["issues"].append(("info", f"T/C {n_} rpm {d_['tc_rpm']:g} looks like thousands - read as {d_['tc_rpm'] * 1000:,.0f}"))
+            d_["tc_rpm"] *= 1000
     res["tc"] = tc
     if sp:
         S = sp[0]
@@ -1213,6 +1286,18 @@ def _read_extras(rows, E_h, E_a, exh_rng, sp, S_a, res):
                 v, _ = scan_below(rows, inl[0], inl[1][0], inl[1][1], max_rows=3)
                 if v is not None:
                     singles["cw_me_in"] = v
+        for key, rx in (("spiral_p", r"pspiral"), ("dp_inout", r"inn\s*/\s*out")):
+            hh = find_cell(rows, S, S + 4, rx)
+            if hh:
+                for n_, v in numbered_values(rows, hh[0] + 1, send_all, hh[1][0], hh[1][1]).items():
+                    tc.setdefault(n_, {})[key] = v
+        tt = find_cell(rows, S, S + 3, r"^turbine$")
+        if tt:
+            oo = find_cell(rows, tt[0] + 1, tt[0] + 3, r"^outlet", tt[1][0] - 20, tt[1][1] + 20)
+            if oo:
+                for n_, v in numbered_values(rows, oo[0] + 1, send_all, oo[1][0], oo[1][1], maxn=4).items():
+                    if v >= 10:
+                        tc.setdefault(n_, {})["cw_turb_out"] = v
         tb = find_cell(rows, S, S + 4, r"^turbochargers")
         if tb:
             for key, rx in (("tc_oil_in", r"^inlet"), ("tc_oil_out", r"^outlet")):
@@ -1227,19 +1312,196 @@ def _read_remarks(rows, res):
     for i, r in enumerate(rows):
         for ci, c in enumerate(r.cells):
             if re.match(r"(?i)^remarks", cl(c[2])):
+                claim(r, c)
+                for x in r.cells[ci + 1:]:
+                    claim(r, x)
                 parts = [cl(x[2]) for x in r.cells[ci + 1:] if cl(x[2])]
                 parts.insert(0, cl(c[2])[7:].strip(" :"))
                 for j in range(i + 1, min(i + 4, len(rows))):
                     parts.extend(cl(x[2]) for x in rows[j].cells if cl(x[2]))
+                    for x in rows[j].cells:
+                        claim(rows[j], x)
                 res["remarks"] = " ".join(p for p in parts if p).strip()
                 return
+
+
+_LABEL_VOCAB = re.compile(r"(?i)^(maker|type|max\s*rpm|max\s*temp|cylinder\s*constant|governor|tc\s*specification|bunker\s*station|oil\s*brand|"
+                          r"fuel\s*oil\s*viscosity|at\s*deg|kjoule|heat\s*value|sulphur|sulfur|density|cylinder\s*oil|circulating\s*oil|"
+                          r"turbo\s*oil|mt\s*/\s*day|engine\s*layout|lub\.?\s*oil\s*system)")
+
+
+def _labelish(t):
+    t = cl(t)
+    return t.endswith(":") or bool(_LABEL_VOCAB.match(t)) or bool(re.match(r"(?i)^(serial\s*no|no)\.?$", t))
+
+
+def _harvest_header(rows, H, res):
+    """Generic label -> value harvest of every still-unclaimed label in the header block."""
+    claimed = _CLAIMS["s"]
+    T = find_cell(rows, 0, H, r"^turbocharger")
+    L = find_cell(rows, 0, H, r"^lub\.?\s*oil\s*system")
+    t_row = T[0] if T else 4
+    l_row = L[0] if L else 9
+    cc_ = find_cell(rows, t_row, l_row + 1, r"^cylinder\s*constant")
+    split = cc_[1][0] - 5 if cc_ else 4300
+    out = res["header_extra"]
+    info = res["tc_info"]
+    serials = {}
+    SER = re.compile(r"(?i)^(?:[A-Z]{1,3}\s?-?)?\d{4,}[A-Z]?$")
+    free = lambda r, c_: (r.idx, c_[0], c_[1]) not in claimed
+
+    def put(key, val):
+        k, n = key, 2
+        while k in out:
+            k, n = f"{key} ({n})", n + 1
+        out[k] = val
+
+    for i in range(1, H):
+        r = rows[i]
+        in_tc = t_row <= i < l_row
+        for k, c_ in enumerate(r.cells):
+            t = cl(c_[2])
+            if not t or not _labelish(t):
+                continue
+            if not free(r, c_):
+                nx = next((z for z in r.cells[k + 1:] if cl(z[2])), None)
+                if nx is None or not free(r, nx) or _labelish(cl(nx[2])):
+                    continue
+            if re.match(r"(?i)^(lub\.?\s*oil\s*system|brand$|type$|serial\s*no|no\.?$)", t) and (i >= l_row or re.match(r"(?i)^(lub|serial|no)", t)):
+                if re.match(r"(?i)^lub", t):
+                    claim(r, c_)
+                continue
+            label, emb = (t.split(":", 1) + [""])[:2] if ":" in t else (t, "")
+            label, emb = label.strip(" :"), emb.strip()
+            vals = [emb] if emb else []
+            m = k + 1
+            while m < len(r.cells) and len(vals) < 3:
+                n_ = r.cells[m]
+                nt = cl(n_[2])
+                m += 1
+                if not nt:
+                    continue
+                if not free(r, n_) or _labelish(nt) or re.match(r"(?i)^(brand|type)$", nt):
+                    break
+                if re.fullmatch(r"[1-4]", nt) and c_[0] < split:
+                    continue
+                if in_tc and c_[0] < split and SER.match(nt) and not re.match(r"(?i)^(max)", label):
+                    serials.setdefault(len(serials) + 1, nt)
+                    claim(r, n_)
+                    continue
+                vals.append(nt)
+                claim(r, n_)
+            if not vals:
+                for j in range(i + 1, min(i + 2, len(rows))):
+                    for n_ in rows[j].cells:
+                        nt = cl(n_[2])
+                        if nt and free(rows[j], n_) and in_col(n_, c_[0], c_[1]) and not _labelish(nt) \
+                                and not any(_labelish(z[2]) and abs(z[0] - c_[0]) < 60 for z in rows[j].cells):
+                            vals.append(nt)
+                            claim(rows[j], n_)
+                            break
+            claim(r, c_)
+            if not vals:
+                continue
+            key = label
+            if in_tc:
+                if c_[0] < split:
+                    key = "Turbocharger " + label[0].lower() + label[1:] if label.lower() in ("maker", "type", "max rpm", "max temp. c", "max temp") else label
+                elif label.lower() == "type":
+                    key = "Governor type"
+            put(key, " · ".join(vals))
+
+    for r in rows[H:]:
+        for c_ in r.cells:
+            mm = re.match(r"(?i)^fo\s*press\.?\s*(?:bar)?\s*(\d+(?:[.,]\d+)?)\s*(?:kg/cm.*)?$", cl(c_[2]))
+            if mm and free(r, c_):
+                put("FO pressure (bar)", mm.group(1).replace(",", "."))
+                claim(r, c_)
+    # turbocharger serial numbers: digit cell followed by a text cell, or text typed on the 'SERIAL No.' line
+    for i in range(t_row, l_row):
+        r = rows[i]
+        for k, c_ in enumerate(r.cells):
+            t = cl(c_[2])
+            if re.fullmatch(r"[1-4]", t) and free(r, c_) and c_[0] < split:
+                for n_ in r.cells[k + 1:]:
+                    nt = cl(n_[2])
+                    if nt:
+                        if free(r, n_) and not _labelish(nt) and n_[0] < split + 400 and not re.fullmatch(r"[1-4]", nt):
+                            serials[int(t)] = nt
+                            claim(r, n_)
+                        break
+                claim(r, c_)
+    ser = find_cell(rows, t_row, t_row + 2, r"^serial")
+    if ser:
+        r = rows[ser[0]]
+        for n_ in r.cells:
+            nt = cl(n_[2])
+            if nt and n_[0] > ser[1][0] and free(r, n_) and not _labelish(nt):
+                serials.setdefault(1, nt)
+                claim(r, n_)
+    m_ = re.fullmatch(r"(?i)(h\s*t\s*\d{5,})", (out.get("TC specification") or "").replace(" ", ""))
+    if m_:
+        serials.setdefault(1, out.pop("TC specification"))
+    if serials:
+        info["serials"] = serials
+    # numeric readings of the T/C spec with unit normalisation
+    raw = out.get("Turbocharger max RPM") or out.get("Max RPM")
+    if raw:
+        n = to_num(raw, "thousands")
+        if n:
+            if re.search(r"1\s*/\s*s\b", raw, re.I):
+                n *= 60
+                res["issues"].append(("info", f"T/C max speed given per second ('{raw}') - converted to {n:,.0f} rpm"))
+            info["max_rpm"] = n
+    raw = out.get("Turbocharger max temp. C") or out.get("Turbocharger max temp")
+    if raw and to_num(raw):
+        info["max_temp"] = to_num(raw)
+    for key, name in (("Turbocharger maker", "maker"), ("Turbocharger type", "type")):
+        if out.get(key):
+            info[name] = out[key]
+    if "Cylinder constant (HP, bar)" in out or any(k.lower().startswith("cylinder constant") for k in out):
+        kk = next(k for k in out if k.lower().startswith("cylinder constant"))
+        info["cyl_constant"] = out[kk]
+    for kk in out:
+        if kk.lower().startswith("governor") and kk != "Governor type":
+            info.setdefault("governor", out[kk])
+    if out.get("Governor type"):
+        info["governor_type"] = out["Governor type"]
+
+
+def _mine_remarks(res):
+    """Pull 'No.1-59, No.2-56 ...' style per-cylinder series out of the free-text remarks."""
+    txt = res.get("remarks") or ""
+    rx = re.compile(r"(?:\bno\.?|\bcyl(?:inder)?\.?|#)\s*#?\s*(\d)\s*[-–:=(]*\s*\(?\s*(\d+(?:[.,]\d+)?)", re.I)
+    ms = list(rx.finditer(txt))
+    series, cur = [], []
+    for m in ms:
+        if cur and m.start() - cur[-1].end() > 30:
+            series.append(cur)
+            cur = []
+        cur.append(m)
+    if cur:
+        series.append(cur)
+    for s in series:
+        if len(s) < 2:
+            continue
+        pre = txt[max(0, s[0].start() - 45):s[0].start()]
+        words = re.findall(r"[A-Za-z][A-Za-z.]*", pre)
+        ctx = " ".join(words[-4:]).strip(". ") or "values in remarks"
+        vals = {}
+        for m in s:
+            v = _num_from_token(m.group(2))
+            if v is not None:
+                vals.setdefault(int(m.group(1)), v)
+        if len(vals) >= 2:
+            res["remarks_series"].append(dict(context=ctx, values=vals))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. CROSS-VALIDATION & CONFIDENCE
 # ─────────────────────────────────────────────────────────────────────────────
 _KEYNAME = {"p_max": "Pmax", "p_comp": "Pcomp", "fuel_index": "Fuel index", "exh_temp": "Exhaust temp",
-            "pmax_adj": "Pmax adjustment", "cw_out": "Jacket CW outlet", "piston_out": "Piston oil outlet"}
+            "pmax_adj": "Pmax adjustment", "cw_out": "Jacket CW outlet", "piston_out": "Piston oil outlet", "pi": "Pi"}
 
 
 def _avg_tier(calc, doc, dec):
@@ -1296,6 +1558,52 @@ def _confidence(res, ranges, nnum, has_avg, has_exh):
     return dict(total=round(total, 1), structure=round(structure, 3), completeness=round(completeness, 3),
                 plausibility=round(plaus, 3), crossval=round(crossval, 3), level=level, label=label,
                 verified_by_sheet=bool(den))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. COVERAGE AUDIT  -  every non-empty cell is claimed, template text, or listed as "not mapped"
+# ─────────────────────────────────────────────────────────────────────────────
+FURNITURE = [
+    r"^\d*this form must be", r"^n/?a$", r"^mm ?h2o$", r"^external (system|from)", r"^(mmhg|mmwc|bar|deg\.? ?c|on|off|brand|type|turbine|receiver|inlet|outlet|average)$",
+    r"^g/(bhp|kw)", r"^exh\. pressure", r"^scavenge air (pressure|temp)", r"^auxil", r"^lubricating oil$", r"^cooling water temp",
+    r"^temperature deg", r"^p bar$", r"^fo p bar$", r"^fo press\.?\s*(bar)?(\s*kg/cm.*)?$", r"^special points", r"^sea water temp", r"^cooling oil$", r"^system oil$",
+    r"^(before|after) filter$", r"^exhaust gas temp", r"^pmax adjustment", r"^(p )?(max|comp) bar$", r"^fuel pump index$",
+    r"^lub\.?\s*oil system", r"^turbocharger\(s\)", r"^serial no", r"^checked by", r"^[1-9]$",
+]
+
+
+def _is_furniture(t):
+    if len(t) <= 1 and not t.isdigit():
+        return True
+    return any(re.match(p, t, re.I) for p in FURNITURE)
+
+
+def _coverage(rows, res):
+    claimed = _CLAIMS["s"] or set()
+    tot = cl_n = fur = 0
+    left = []
+    for r in rows:
+        for ci, c in enumerate(r.cells):
+            t = cl(c[2])
+            if not t:
+                continue
+            tot += 1
+            if (r.idx, c[0], c[1]) in claimed:
+                cl_n += 1
+            elif _is_furniture(t):
+                fur += 1
+            else:
+                prev = next((cl(x[2]) for x in reversed(r.cells[:ci]) if cl(x[2])), "")
+                above = ""
+                for j in range(r.idx - 1, max(r.idx - 6, -1), -1):
+                    hit = [cl(x[2]) for x in rows[j].cells if cl(x[2]) and in_col(x, c[0], c[1])]
+                    if hit:
+                        above = hit[0]
+                        break
+                left.append(dict(row=r.idx, col=ci + 1, text=t[:160], left=prev[:60], above=above[:60]))
+    res["unclaimed"] = left
+    res["coverage"] = dict(total=tot, claimed=cl_n, template=fur, unmapped=len(left),
+                           pct=round(100.0 * (cl_n + fur) / tot, 1) if tot else 100.0)
 # ═══ END PARSER ═══
 
 
@@ -1852,7 +2160,8 @@ SINGLE_LABELS = [("scav_bar", "Scavenge pressure", "bar", 2), ("scav_temp", "Sca
                  ("fo_after_filter", "FO pressure after filter", "bar", 2), ("fo_temp", "FO temperature", "°C", 0)]
 TC_LABELS = [("tc_rpm", "T/C RPM", 0), ("turb_in", "Turbine inlet °C", 0), ("turb_out", "Turbine outlet °C", 0), ("exh_press", "Exh. receiver pressure", 2),
              ("dp_filter", "Δp air filter", 1), ("dp_cooler", "Δp air cooler", 2), ("inl_blower", "Blower inlet °C", 0),
-             ("bef_cooler", "Air before cooler °C", 0), ("aft_cooler", "Air after cooler °C", 0)]
+             ("bef_cooler", "Air before cooler °C", 0), ("aft_cooler", "Air after cooler °C", 0),
+             ("spiral_p", "Spiral housing pressure", 2), ("dp_inout", "T/C Δp in/out", 1), ("cw_turb_out", "CW turbine outlet °C", 0)]
 
 
 def render_report_card(rep: dict) -> None:
@@ -1876,7 +2185,8 @@ def render_report_card(rep: dict) -> None:
     test = " · ".join(x for x in [f'{op["rpm"]:.0f} rpm' if op.get("rpm") else "", f'{op["load_pct"]:.0f} % load' if op.get("load_pct") else ""] if x)
     facts = (fact("Report date", fdate(idn.get("date"))) + fact("Cylinders", n_note) + fact("Rated output", power) + fact("Test condition", test)
              + fact("Engine no.", idn.get("engine_no")) + fact("Running hours", f'{op["run_hours"]:,.0f}' if op.get("run_hours") else None)
-             + fact("Fuel", fuel) + fact("Checked by", idn.get("checked_by")))
+             + fact("Fuel", fuel) + fact("Checked by", idn.get("checked_by"))
+             + fact("Sheet coverage", (f'{p["coverage"]["pct"]:.0f} % of cells mapped' + (f' · {p["coverage"]["unmapped"]} not mapped' if p["coverage"]["unmapped"] else "")) if p.get("coverage") else None))
     sub = " · ".join(x for x in [idn.get("engine_type"), idn.get("builder"), (f'yard {idn["yard"]}' if idn.get("yard") else ""),
                                   (f'built {idn["built_year"]}' if idn.get("built_year") else "")] if x)
     md(f'<div class="card gold"><div class="vs"><div><p class="lbl">Vessel</p><div class="vname">{esc(idn.get("vessel") or rep["name"])}</div>'
@@ -2060,7 +2370,8 @@ def export_json(rep: dict, an: dict) -> bytes:
     doc = dict(generator=f"M.E. Command Center v{APP_VERSION}", file=rep["name"], generated=time.strftime("%Y-%m-%d %H:%M:%S"),
                identity=p["identity"], operating=p["op"], confirmed=rep["confirmed"], confidence=p["confidence"], cross_checks=p.get("xval", {}),
                sheet_averages={k: v[0] for k, v in p.get("avgs_doc", {}).items()}, cylinders=an["df"].where(an["df"].notna(), None).to_dict(orient="records"),
-               health_score=an["score"], findings=an["findings"], turbocharger=p.get("tc", {}), auxiliary=p.get("singles", {}), remarks=p.get("remarks"),
+               health_score=an["score"], findings=an["findings"], turbocharger=p.get("tc", {}), auxiliary=p.get("singles", {}), remarks=p.get("remarks"), header_details=p.get("header_extra"), tc_specification=p.get("tc_info"), remarks_series=p.get("remarks_series"),
+               coverage=p.get("coverage"), unmapped_cells=p.get("unclaimed"), cylinders_raw=p.get("cylinders"),
                notes=[dict(severity=s, message=m) for s, m in p["issues"]])
     return json.dumps(doc, indent=2, default=str, ensure_ascii=False).encode("utf-8")
 
@@ -2090,7 +2401,7 @@ def render_audit(rep: dict) -> None:
     conf = p["confidence"]
     # cross-checks
     names = {"p_max": "P max", "p_comp": "P comp", "fuel_index": "Fuel index", "exh_temp": "Exhaust temp", "pmax_adj": "Pmax adjustment",
-             "cw_out": "Jacket CW outlet", "piston_out": "Piston oil outlet"}
+             "cw_out": "Jacket CW outlet", "piston_out": "Piston oil outlet", "pi": "Pi"}
     tone = {"match": "ok", "near": "info", "weak": "warn", "mismatch": "crit"}
     rows = []
     for k, v in p.get("xval", {}).items():
@@ -2142,6 +2453,29 @@ def render_audit(rep: dict) -> None:
         if trows:
             md('<p class="lbl" style="margin-top:1.1rem">Turbocharger readings</p>')
             md(table_html(["Reading"] + [f"T/C {t}" for t in sorted(p["tc"])], trows))
+    ops = [(lab, p["op"][k]) for k, lab in (("hour", "Hour of test"), ("wave_dir", "Wave direction")) if p["op"].get(k)]
+    if ops:
+        md('<div class="card"><div class="facts">' + "".join(fact(a, b) for a, b in ops) + "</div></div>")
+    ti = p.get("tc_info") or {}
+    if ti:
+        tl = [("Maker", ti.get("maker")), ("Type", ti.get("type")), ("Max speed", f'{ti["max_rpm"]:,.0f} rpm' if ti.get("max_rpm") else None),
+              ("Max temperature", f'{ti["max_temp"]:,.0f} °C' if ti.get("max_temp") else None), ("Serial no.", ", ".join(f"T/C {k}: {v}" for k, v in sorted(ti.get("serials", {}).items())) or None),
+              ("Governor", ti.get("governor")), ("Governor type", ti.get("governor_type")), ("Cylinder constant", ti.get("cyl_constant"))]
+        md('<p class="lbl" style="margin-top:1.1rem">Turbocharger & governor specification</p><div class="card"><div class="facts">' + "".join(fact(a, b) for a, b in tl if b) + "</div></div>")
+    hx = {k: v for k, v in (p.get("header_extra") or {}).items() if not k.startswith(("Turbocharger", "Governor", "Cylinder constant"))}
+    if hx:
+        md('<p class="lbl" style="margin-top:1.1rem">Fuel, lubricants & other header details</p><div class="card"><div class="facts">' + "".join(fact(k, v) for k, v in hx.items()) + "</div></div>")
+    for s_ in p.get("remarks_series") or []:
+        md(f'<p class="lbl" style="margin-top:1.1rem">Values read from the remarks · {esc(s_["context"])}</p>'
+           + table_html(["Cyl"] + [str(k) for k in sorted(s_["values"])], [["Value"] + [f"{s_['values'][k]:g}" for k in sorted(s_["values"])]])
+           + '<p class="note">Parsed from free text - not part of the sheet columns, shown for reference only.</p>')
+    cov = p.get("coverage")
+    if cov:
+        md(f'<p class="lbl" style="margin-top:1.1rem">Sheet coverage</p><div class="note">{cov["claimed"]} of {cov["total"]} cells mapped to a field · {cov["template"]} printed template labels · '
+           f'<b>{cov["unmapped"]} not mapped</b>.</div>')
+        if p.get("unclaimed"):
+            md(table_html(["Row", "Text on the sheet", "Next to", "Above"], [[str(u["row"]), esc(u["text"][:120]), esc(u["left"][:40]), esc(u["above"][:40])] for u in p["unclaimed"]])
+               + '<p class="note">These cells carry text the reader could not assign to a field. Nothing is hidden - check them against the document.</p>')
     if p.get("remarks"):
         md(f'<p class="lbl" style="margin-top:1.1rem">Remarks written on the sheet</p><div class="card"><p style="margin:0;font-size:.9rem">{esc(p["remarks"])}</p></div>')
 
