@@ -1,5 +1,5 @@
-streamlit>=1.32.0
+streamlit>=1.40.0
 pandas>=2.0.0
 plotly>=5.18.0
-pydantic>=2.0.0
+pydantic>=2.5.0
 olefile>=0.47
