@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# company data must never be committed
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.xlsm
