@@ -1,9 +1,10 @@
 """
 Auxiliary engines (TEC-014)  -  reader, analysis and Streamlit tab in one module.
 
-Sections:  1. PARSER    (pure Python: openpyxl / xlrd, no Streamlit)
-           2. ANALYSIS  (pure Python + pandas)
-           3. UI        (Streamlit tab; re-uses the main-engine design system, every key prefixed `dg_`)
+Sections:  1. PARSER     read the workbook by label (pure Python: openpyxl / xlrd, no Streamlit)
+           2. DIAGNOSIS  input checks -> shop-trial reference -> engine findings -> probable causes -> verdict -> crew action list
+           3. FLEET      comparisons between generators and between months
+           4. UI         the Streamlit tab (re-uses the main-engine design system; every key is prefixed `dg_`)
 
 The sheet is read by LABEL, never by cell address: crews insert / delete rows, so the same field sits on
 a different row in different files.  Layout assumed from the printed form:
@@ -25,16 +26,15 @@ import re
 import time
 import zipfile
 from datetime import date as _date
-from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from me_engine import (APP_VERSION, C_CRIT, C_GOLD, C_GOLD2, C_INFO, C_MUTED, C_OK, C_ORANGE, C_WARN, _style, chip, esc, fact, fnum,
-                       health_color, kpi, md, plot, ring_svg, section, stretch, table_html)
+from me_engine import (APP_VERSION, C_GOLD, C_GOLD2, C_INFO, C_MUTED, C_OK, C_ORANGE, C_WARN, _style, chip, esc, fact, fnum,
+                       kpi, md, plot, ring_svg, section, stretch, table_html)
 
 # ====================================================================================================
 # 1. PARSER
@@ -494,7 +494,7 @@ def _parse(data: bytes) -> dict:
 
     # ---- tested load row ----------------------------------------------------------------
     test = dict(kw=None, amps=None, load_frac=None, raw=None, ref=None)
-    shop = {"shopA": dict(load=None, raw=None), "shopB": dict(load=None, raw=None)}
+    shop = {"shopA": dict(load=None, raw=None, ref=None), "shopB": dict(load=None, raw=None, ref=None)}
     claim(body0, 1)
     if (body0, 2) in G:
         claim(body0, 2)                                    # unit hint ("kw / A / %") - or a stray label the crew typed over it
@@ -522,7 +522,7 @@ def _parse(data: bytes) -> dict:
         v, ref = group_value(body0, g)
         if v is None:
             continue
-        shop[g]["raw"] = v
+        shop[g]["raw"], shop[g]["ref"] = v, ref
         n, _ = to_num(v)
         if n is not None and n > 0:
             if n <= 1.5:
@@ -871,19 +871,36 @@ def _parse(data: bytes) -> dict:
 
 
 # ====================================================================================================
-# 2. ANALYSIS
+# 2. DIAGNOSIS
+#    input checks  →  shop-trial reference  →  engine findings  →  probable causes  →  verdict  →  crew action list
 # ====================================================================================================
+#  Every finding is a dict:
+#     sev        critical | mechanical | warning | advisory
+#     cat        engine | reference | diagnosis | load   (the engine itself)      data  (the sheet - "check the entry")
+#     title      short heading                 fault     what was seen, with the figures
+#     causes     likely causes (list)          actions   what the crew should do (list)
+#     when       now | soon | planned | retest | recheck        cyl   cylinder number or None
+#     uses       readings the finding is based on              provisional   True if one of them failed a consistency check
+# ----------------------------------------------------------------------------------------------------
 
 SEV_RANK = {"critical": 5, "mechanical": 4, "warning": 3, "advisory": 2, "nominal": 1}
 SEV_LABEL = {"critical": "Critical", "mechanical": "Mechanical", "warning": "Warning", "advisory": "Advisory", "nominal": "Nominal"}
 SEV_CHIP = {"critical": "crit", "mechanical": "orange", "warning": "warn", "advisory": "info", "nominal": "ok"}
 
-TH_DEFAULT: dict[str, float] = dict(
+# when to act: key -> (sort order, label)
+URGENCY = {"recheck": (0, "Re-check the entries first"), "now": (1, "Act now"), "soon": (2, "This week / before the next port"),
+           "planned": (3, "At the next planned maintenance"), "retest": (4, "At the next monthly test")}
+URGENCY_BY_SEV = {"critical": "now", "mechanical": "soon", "warning": "soon", "advisory": "retest"}
+
+# ───────────────────────────── settings (editable in the sidebar) ─────────────────────────────
+TH_DEFAULT: dict[str, Any] = dict(
     low_load=0.50,            # test below this fraction of rated output is flagged
     exh_dev=25.0, exh_dev_crit=40.0, exh_abs=480.0, exh_abs_crit=520.0,
     pmax_dev=4.0, pmax_dev_warn=7.0, rack_dev=6.0, rack_dev_warn=10.0, inj_spread=0.5, inj_spread_warn=1.0,
     jacket_out_max=85.0, lo_out_max=75.0, boost_air_max=55.0, lo_p_min=3.0, lo_p_tc_min=1.5, brg_max=80.0,
     ref_exh=30.0, ref_pmax=8.0, ref_boost=12.0, ref_rack=12.0,
+    shop_mode="auto",         # auto = a typed shop-trial load close to a standard point is read as that point | printed = use as typed
+    shop_points="50, 75",     # the % loads at which the maker's shop trials were run
 )
 TH_SPECS = [  # key, label, step, format
     ("low_load", "Low-load test below (fraction of rated)", 0.05, "%.2f"),
@@ -898,30 +915,53 @@ TH_SPECS = [  # key, label, step, format
     ("ref_exh", "vs shop trial · exhaust (± °C)", 1.0, "%.0f"), ("ref_pmax", "vs shop trial · Pmax (± %)", 0.5, "%.1f"),
     ("ref_boost", "vs shop trial · boost (± %)", 0.5, "%.1f"), ("ref_rack", "vs shop trial · rack (± %)", 0.5, "%.1f"),
 ]
-
-
 MAX_EXTRAPOLATION = 0.10      # beyond this distance (fraction of rated load) outside the shop-trial range no reference is given
+SHOP_SNAP_TOLERANCE = 0.12    # a typed shop-trial load this close to a standard point is read as that point
+
+
+def _ok(x) -> bool:
+    return x is not None and x == x
 
 
 def _mean(xs) -> Optional[float]:
-    xs = [x for x in xs if x is not None and x == x]
+    xs = [x for x in xs if _ok(x)]
     return sum(xs) / len(xs) if xs else None
 
 
 def _spread(xs) -> Optional[float]:
-    xs = [x for x in xs if x is not None and x == x]
+    xs = [x for x in xs if _ok(x)]
     return (max(xs) - min(xs)) if len(xs) >= 2 else None
 
 
-# ───────────────────────────── cylinder frame ─────────────────────────────
+def _pct(x: float) -> str:
+    return f"{x * 100:.0f} %"
+
+
+def _g(x: float) -> str:
+    """A reading for a sentence: at most one decimal."""
+    return f"{x:.1f}".rstrip("0").rstrip(".")
+
+
+def parse_points(text) -> list[float]:
+    """'50, 75' -> [0.5, 0.75].  Unreadable input falls back to the default."""
+    out = []
+    for tok in re.split(r"[;,/\s]+", str(text or "")):
+        try:
+            x = float(tok)
+        except ValueError:
+            continue
+        x = x / 100 if x > 1.5 else x
+        if 0.05 <= x <= 1.3:
+            out.append(round(x, 4))
+    return sorted(set(out)) or [0.5, 0.75]
+
+
+# ───────────────────────────── per-cylinder table ─────────────────────────────
 def cyl_frame(p: dict, group: str = "act") -> pd.DataFrame:
-    n = p["n_cylinders"]
     f = p["units"]["pmax_factor"]
     rows = []
-    for i in range(1, n + 1):
-        row = {"id": i}
-        for m in ("inj", "exh", "pmax", "rack"):
-            row[m] = p["cyl"][group][m].get(i)
+    for i in range(1, p["n_cylinders"] + 1):
+        row = {"id": i, **{m: p["cyl"][group][m].get(i) for m in ("inj", "exh", "pmax", "rack")}}
         row["pmax_bar"] = row["pmax"] * f if row["pmax"] is not None else None
         rows.append(row)
     df = pd.DataFrame(rows, columns=["id", "inj", "exh", "pmax", "pmax_bar", "rack"])
@@ -934,26 +974,71 @@ def load_fraction(p: dict) -> Optional[float]:
     return p["test"].get("load_frac")
 
 
+# ───────────────────────────── shop-trial load points ─────────────────────────────
+def shop_loads(p: dict, th: dict) -> dict:
+    """The load each shop-trial block was really run at.
+
+    The crew types the two load points by hand, and they are often wrong - typically the engine's own test load is typed
+    there (59 %) instead of the load of the maker's shop trial (50 %).  In 'auto' mode a typed value that is close to one of
+    the standard points is read as that point; the app always shows what was typed and what was used."""
+    L = load_fraction(p)
+    std = parse_points(th["shop_points"])
+    out = {}
+    for g in ("shopA", "shopB"):
+        printed = p["shop"][g]["load"]
+        d = dict(printed=printed, used=printed, std=None, note="", status="missing" if printed is None else "as_printed")
+        if printed is not None:
+            near = min(std, key=lambda s: abs(s - printed))
+            gap = abs(near - printed)
+            if gap <= 0.005:
+                d.update(status="standard", std=near)
+            elif th["shop_mode"] != "auto":
+                d["note"] = f"typed {_pct(printed)}, which is not a standard shop-trial point (nearest {_pct(near)}) - used as typed"
+            elif gap <= SHOP_SNAP_TOLERANCE:
+                d.update(status="corrected", used=near, std=near, note=f"typed {_pct(printed)}, read as the {_pct(near)} shop-trial point")
+                if L is not None and abs(printed - L) <= 0.03:
+                    d["note"] += " (the typed value equals this engine's own tested load - it was probably copied from there)"
+            else:
+                d.update(status="non_standard", note=f"{_pct(printed)} is not one of the standard points ({', '.join(f'{s * 100:.0f}' for s in std)} %) - used as typed")
+        out[g] = d
+    a, b = out["shopA"], out["shopB"]
+    if a["used"] is not None and b["used"] is not None and abs(a["used"] - b["used"]) < 0.05 and (a["status"] == "corrected" or b["status"] == "corrected"):
+        for d in (a, b):                                    # both blocks would collapse onto one point: keep what was typed
+            d.update(used=d["printed"], status="non_standard", note="both blocks map to the same standard point - used as typed")
+    return out
+
+
 # ───────────────────────────── shop-trial reference ─────────────────────────────
+class RefSpec(NamedTuple):
+    key: str
+    label: str
+    unit: Optional[str]          # None -> the Pmax unit of the sheet
+    src: str                     # "cyl:<metric>" (mean of the cylinders) or "single:<reading>"
+    tol_kind: str                # abs | pct
+    th_key: Optional[str]        # threshold that turns a deviation into a finding (None = shown only)
+    core: bool                   # core parameters drive the findings
+    trend: str                   # rise = must not fall as load rises | steady = hardly changes with load | free
+    swing: float = 0.0           # steady: largest believable change between the two blocks (°C, or a fraction for pressures)
+
+
 REF_SPECS = [
-    # key, label, unit(None -> pmax unit), source, tolerance kind, threshold key, core, must rise with load
-    ("exh_mean", "Exhaust gas temperature (mean)", "°C", "cyl:exh", "abs", "ref_exh", True, True),
-    ("pmax_mean", "Pmax (mean)", None, "cyl:pmax", "pct", "ref_pmax", True, True),
-    ("rack_mean", "Fuel rack (mean)", "mm", "cyl:rack", "pct", "ref_rack", True, True),
-    ("boost_p", "Boost air pressure", "kgf/cm²", "single:boost_p", "pct", "ref_boost", True, True),
-    ("tc_out", "T/C outlet temperature", "°C", "single:tc_out", "abs", None, False, True),
-    ("ba_cyl_in", "Boost air · cylinder inlet", "°C", "single:ba_cyl_in", "abs", None, False, False),
-    ("cw_jacket_in", "Jacket CW inlet", "°C", "single:cw_jacket_in", "abs", None, False, False),
-    ("cw_engine_out", "Engine CW outlet", "°C", "single:cw_engine_out", "abs", None, False, False),
-    ("cw_ac_in", "Air cooler CW inlet", "°C", "single:cw_ac_in", "abs", None, False, False),
-    ("lo_t_out", "L.O. cooler outlet", "°C", "single:lo_t_out", "abs", None, False, False),
-    ("lo_p_engine", "L.O. pressure · engine", "kgf/cm²", "single:lo_p_engine", "pct", None, False, False),
-    ("lo_p_tc", "L.O. pressure · T/C", "kgf/cm²", "single:lo_p_tc", "pct", None, False, False),
-    ("fo_p_in", "FO pressure, engine inlet", "bar", "single:fo_p_in", "pct", None, False, False),
-    ("fo_t_in", "FO temperature, engine inlet", "°C", "single:fo_t_in", "abs", None, False, False),
-    ("cw_p_jacket", "Cooling water pressure · jacket", "kgf/cm²", "single:cw_p_jacket", "pct", None, False, False),
-    ("gen_brg_de", "Generator bearing · engine side", "°C", "single:gen_brg_de", "abs", None, False, False),
-    ("gen_brg_nde", "Generator bearing · opposite side", "°C", "single:gen_brg_nde", "abs", None, False, False),
+    RefSpec("exh_mean", "Exhaust gas temperature (mean)", "°C", "cyl:exh", "abs", "ref_exh", True, "rise"),
+    RefSpec("pmax_mean", "Pmax (mean)", None, "cyl:pmax", "pct", "ref_pmax", True, "rise"),
+    RefSpec("rack_mean", "Fuel rack (mean)", "mm", "cyl:rack", "pct", "ref_rack", True, "rise"),
+    RefSpec("boost_p", "Boost air pressure", "kgf/cm²", "single:boost_p", "pct", "ref_boost", True, "rise"),
+    RefSpec("tc_out", "T/C outlet temperature", "°C", "single:tc_out", "abs", None, False, "rise"),
+    RefSpec("ba_cyl_in", "Boost air · cylinder inlet", "°C", "single:ba_cyl_in", "abs", None, False, "steady", 12),
+    RefSpec("cw_jacket_in", "Jacket CW inlet", "°C", "single:cw_jacket_in", "abs", None, False, "steady", 15),
+    RefSpec("cw_engine_out", "Engine CW outlet", "°C", "single:cw_engine_out", "abs", None, False, "steady", 15),
+    RefSpec("cw_ac_in", "Air cooler CW inlet", "°C", "single:cw_ac_in", "abs", None, False, "steady", 12),
+    RefSpec("lo_t_out", "L.O. cooler outlet", "°C", "single:lo_t_out", "abs", None, False, "steady", 15),
+    RefSpec("lo_p_engine", "L.O. pressure · engine", "kgf/cm²", "single:lo_p_engine", "pct", None, False, "steady", 0.35),
+    RefSpec("lo_p_tc", "L.O. pressure · T/C", "kgf/cm²", "single:lo_p_tc", "pct", None, False, "steady", 0.35),
+    RefSpec("fo_p_in", "FO pressure, engine inlet", "bar", "single:fo_p_in", "pct", None, False, "steady", 0.35),
+    RefSpec("fo_t_in", "FO temperature, engine inlet", "°C", "single:fo_t_in", "abs", None, False, "steady", 20),
+    RefSpec("cw_p_jacket", "Cooling water pressure · jacket", "kgf/cm²", "single:cw_p_jacket", "pct", None, False, "steady", 0.35),
+    RefSpec("gen_brg_de", "Generator bearing · engine side", "°C", "single:gen_brg_de", "abs", None, False, "free"),
+    RefSpec("gen_brg_nde", "Generator bearing · opposite side", "°C", "single:gen_brg_nde", "abs", None, False, "free"),
 ]
 
 
@@ -964,25 +1049,37 @@ def _src_value(p: dict, group: str, src: str) -> Optional[float]:
     return p["values"][group].get(key)
 
 
-def shop_reference(p: dict, th: dict) -> list[dict]:
-    """One row per comparable parameter: actual, both shop points, interpolated reference and deviation."""
+def _block_problem(spec: RefSpec, v1: float, v2: float) -> str:
+    """Why the two shop-trial values (low-load point -> high-load point) cannot both be right, or ''."""
+    if spec.trend == "rise" and v2 < v1 - 0.02 * abs(v1):
+        return "falls as the load rises"
+    if spec.trend == "steady":
+        change = abs(v2 - v1) if spec.tol_kind == "abs" else abs(v2 - v1) / max(abs(v1), abs(v2), 1e-9)
+        if change > spec.swing:
+            return f"changes by {abs(v2 - v1):.3g} between the two load points"
+    return ""
+
+
+def shop_reference(p: dict, th: dict, loads: dict) -> list[dict]:
+    """One row per comparable parameter: actual, both shop points, the reference at the tested load, deviation, implied load."""
     L = load_fraction(p)
-    la, lb = p["shop"]["shopA"]["load"], p["shop"]["shopB"]["load"]
+    la, lb = loads["shopA"]["used"], loads["shopB"]["used"]
     out = []
-    for key, label, unit, src, tol_kind, th_key, core, mono in REF_SPECS:
-        a = _src_value(p, "act", src)
-        sa, sb = _src_value(p, "shopA", src), _src_value(p, "shopB", src)
+    for s in REF_SPECS:
+        a = _src_value(p, "act", s.src)
+        sa, sb = _src_value(p, "shopA", s.src), _src_value(p, "shopB", s.src)
         if a is None and sa is None and sb is None:
             continue
-        row = dict(key=key, label=label, unit=unit if unit is not None else p["units"]["pmax"], act=a, shopA=sa, shopB=sb, ref=None, delta=None,
-                   delta_pct=None, method="none", core=core, tol_kind=tol_kind, tol=th.get(th_key) if th_key else None, note="")
+        row = dict(key=s.key, label=s.label, unit=s.unit if s.unit is not None else p["units"]["pmax"], act=a, shopA=sa, shopB=sb, ref=None, delta=None,
+                   delta_pct=None, implied=None, method="none", core=s.core, tol_kind=s.tol_kind, tol=th.get(s.th_key) if s.th_key else None, note="")
         pts = [(l, v) for l, v in ((la, sa), (lb, sb)) if l is not None and v is not None]
         if L is None:
             row["note"] = "tested load unknown"
         elif len(pts) == 2 and abs(pts[0][0] - pts[1][0]) >= 0.05:
             (l1, v1), (l2, v2) = sorted(pts)
-            if mono and v2 < v1 - 0.02 * abs(v1):
-                row["method"], row["note"] = "inconsistent", "shop-trial values fall as load rises - reference not used"
+            problem = _block_problem(s, v1, v2)
+            if problem:
+                row["method"], row["note"] = "inconsistent", f"shop-trial value {problem} - reference not used"
             else:
                 ref = v1 + (v2 - v1) * (L - l1) / (l2 - l1)
                 far = max(l1 - L, L - l2, 0.0)
@@ -990,15 +1087,17 @@ def shop_reference(p: dict, th: dict) -> list[dict]:
                     row["ref"], row["method"] = ref, "interpolated"
                 elif far <= MAX_EXTRAPOLATION:
                     row["ref"], row["method"] = ref, "extrapolated"
-                    row["note"] = f"load {L * 100:.0f} % lies {far * 100:.0f} points outside the shop-trial range {l1 * 100:.0f}-{l2 * 100:.0f} %"
+                    row["note"] = f"load {_pct(L)} lies {far * 100:.0f} points outside the shop-trial range {_pct(l1)}-{_pct(l2)}"
                 else:
                     row["method"] = "out_of_range"
-                    row["note"] = f"load {L * 100:.0f} % is {far * 100:.0f} points outside the shop-trial range {l1 * 100:.0f}-{l2 * 100:.0f} % - no reference"
-        elif len(pts) >= 1:
+                    row["note"] = f"load {_pct(L)} is {far * 100:.0f} points outside the shop-trial range {_pct(l1)}-{_pct(l2)} - no reference"
+                if s.core and s.trend == "rise" and a is not None and v2 != v1:        # which shop-trial load would this reading correspond to?
+                    row["implied"] = l1 + (a - v1) / (v2 - v1) * (l2 - l1)
+        elif pts:
             l1, v1 = min(pts, key=lambda t: abs(t[0] - L))
             if abs(L - l1) <= 0.12:
                 row["ref"], row["method"] = v1, "single"
-                row["note"] = f"single shop-trial point at {l1 * 100:.0f} %"
+                row["note"] = f"single shop-trial point at {_pct(l1)}"
             else:
                 row["note"] = "shop-trial point too far from the tested load"
         if row["ref"] is not None and a is not None:
@@ -1008,154 +1107,399 @@ def shop_reference(p: dict, th: dict) -> list[dict]:
     return out
 
 
-# ───────────────────────────── findings ─────────────────────────────
-CYL_LABEL = {"exh": "exhaust", "pmax": "Pmax", "rack": "fuel rack"}
+# ───────────────────────────── analysis context ─────────────────────────────
+LABELS = {**{k: v[0] for k, v in PARAMS.items()}, "exh_mean": "Mean cylinder exhaust temperature", "ambient_t": "Ambient temperature",
+          "sea_t": "Sea water temperature"}
 
 
-def _f(sev, title, fault, action, cyl=None, cat="engine"):
-    return dict(sev=sev, title=title, fault=fault, action=action, cyl=cyl, cat=cat)
+class Ctx:
+    """Everything the checks need, plus the list they add findings to."""
+
+    def __init__(self, p: dict, th: dict):
+        self.p, self.th = p, th
+        self.v = p["values"]["act"]
+        self.i = p["identity"]
+        self.L = load_fraction(p)
+        self.df = cyl_frame(p)
+        d, nan = self.df, float("nan")
+        self.m = dict(exh=_mean(d["exh"]), pmax=_mean(d["pmax"]), rack=_mean(d["rack"]), inj=_mean(d["inj"]))
+        d["exh_dev"] = d["exh"] - self.m["exh"] if self.m["exh"] is not None else nan
+        d["pmax_dev_pct"] = (d["pmax"] - self.m["pmax"]) / self.m["pmax"] * 100 if self.m["pmax"] else nan
+        d["rack_dev_pct"] = (d["rack"] - self.m["rack"]) / self.m["rack"] * 100 if self.m["rack"] else nan
+        d["inj_dev"] = d["inj"] - self.m["inj"] if self.m["inj"] is not None else nan
+        self.loads: dict = {}
+        self.ref: list[dict] = []
+        self.F: list[dict] = []
+        self.checks_run = 0
+
+    def reading(self, key: str) -> Optional[float]:
+        if key == "exh_mean":
+            return self.m["exh"]
+        if key in ("ambient_t", "sea_t"):
+            return self.i.get(key)
+        return self.v.get(key)
+
+    def cells(self, *keys: str) -> str:
+        refs = self.p["refs"]
+        return ", ".join(dict.fromkeys(c for c in (refs.get(f"act.{k}") or refs.get(k) for k in keys) if c))
+
+    def usable_ref(self, key: str) -> Optional[dict]:
+        r = next((x for x in self.ref if x["key"] == key), None)
+        return r if r and r["delta"] is not None and r["method"] in ("interpolated", "extrapolated", "single") else None
+
+    def add(self, sev, title, fault, actions, causes=(), cyl=None, topic="engine", when=None, uses=(), cells="") -> None:
+        cat = topic if topic in ("data", "diagnosis", "reference", "load") else "engine"
+        self.F.append(dict(sev=sev, title=title, fault=fault, actions=list(actions), causes=list(causes), cyl=cyl, topic=topic, cat=cat, uses=tuple(uses),
+                           cells=cells, when=when or ("recheck" if cat == "data" else URGENCY_BY_SEV[sev]), provisional=False))
+
+
+SAME_TEST = "Repeat the test at the same load to confirm the reading."
+FIX_SHEET = "Correct the sheet and upload the report again."
 
 
 def _smoke_class(text: Optional[str]) -> str:
     t = (text or "").upper()
     if not t.strip():
         return "unknown"
-    if re.search(r"BLACK|DARK|HEAVY|THICK|SOOT", t):
-        return "black"
-    if re.search(r"BLUE", t):
-        return "blue"
-    if re.search(r"WHITE|GREY|GRAY", t):
-        return "white"
-    if re.search(r"HAZY|LIGHT|CLEAR|CLEAN|INVISIBLE|NIL|NONE|SLIGHT", t):
-        return "light"
-    if re.search(r"BROWN", t):
-        return "brown"
+    for cls, rx in (("black", r"BLACK|DARK|HEAVY|THICK|SOOT"), ("blue", r"BLUE"), ("white", r"WHITE|GREY|GRAY"),
+                    ("light", r"HAZY|LIGHT|CLEAR|CLEAN|INVISIBLE|NIL|NONE|SLIGHT"), ("brown", r"BROWN")):
+        if re.search(rx, t):
+            return cls
     return "unknown"
 
 
-def analyze(p: dict, th: Optional[dict] = None) -> dict:
-    th = {**TH_DEFAULT, **(th or {})}
-    df = cyl_frame(p)
-    n = p["n_cylinders"]
-    v = p["values"]["act"]
-    L = load_fraction(p)
-    F: list[dict] = []
-    unit_p = p["units"]["pmax"]
+# ───────────────────────────── A. input checks ("is the sheet itself believable?") ─────────────────────────────
+# (group, hot reading, cold reading, minimum gap, why).  The hot reading must exceed the cold reading by at least the gap.
+# A gap below zero is a tolerance: the 'hot' reading may be at most that much below the 'cold' one.
+PAIR_RULES = [
+    ("jacket", "cw_engine_out", "cw_jacket_in", 1, "cooling water picks up heat in the engine, so it must leave warmer than it enters"),
+    ("airc_w", "cw_ac_out", "cw_ac_in", 1, "cooling water picks up heat in the air cooler, so it must leave warmer than it enters"),
+    ("loc_w", "cw_lo_out", "cw_lo_in", 1, "cooling water picks up heat in the L.O. cooler, so it must leave warmer than it enters"),
+    ("loc_o", "lo_t_in", "lo_t_out", 1, "lube oil is cooled in the cooler, so it must enter hotter than it leaves"),
+    ("loc_o", "lo_t_out", "cw_lo_in", 0, "lube oil cannot leave the cooler colder than the water that cools it"),
+    ("air", "ba_ac_in", "ba_cyl_in", 1, "charge air is cooled in the air cooler, so it must enter hotter than it leaves"),
+    ("air", "ba_cyl_in", "cw_ac_in", 2, "charge air cannot be cooled to (or below) the temperature of the cooling water entering the air cooler - "
+                                        "a gap of several degrees is normal"),
+    ("sea", "cw_ac_in", "sea_t", 0, "the low-temperature cooling water is cooled by the sea, so it cannot be colder than the sea water"),
+    ("sea", "cw_lo_in", "sea_t", 0, "the low-temperature cooling water is cooled by the sea, so it cannot be colder than the sea water"),
+    ("tc", "exh_mean", "tc_out", 30, "gas cools down in the turbine, so the T/C outlet must be well below the cylinder exhaust temperatures"),
+    ("tc", "exh_mean", "tc_pair_out", 30, "gas cools down in the turbine, so the T/C outlet must be well below the cylinder exhaust temperatures"),
+    ("tc", "tc_pair_in", "tc_pair_out", 60, "the turbine takes a large temperature drop out of the gas (normally more than 60 °C at this load)"),
+    ("tc", "tc_in", "tc_out", 60, "the turbine takes a large temperature drop out of the gas (normally more than 60 °C at this load)"),
+    *[("tc", "exh_mean", k, -30, "the gas arriving at the turbine cannot be much hotter than the cylinder exhaust temperatures it is made of")
+      for k in ("tc_pair_in", "tc_in", "tc_in_upper", "tc_in_lower")],
+    ("bearing", "gen_brg_de", "ambient_t", -3, "a running generator bearing cannot be colder than the air around it"),
+    ("bearing", "gen_brg_nde", "ambient_t", -3, "a running generator bearing cannot be colder than the air around it"),
+]
+PAIR_GROUPS = {   # group -> (title, what the crew should do)
+    "jacket": ("Jacket cooling-water temperatures", ["Re-read the jacket-water inlet and outlet thermometers at steady load."]),
+    "airc_w": ("Air-cooler water temperatures", ["Re-read the air-cooler water inlet and outlet thermometers."]),
+    "loc_w": ("L.O.-cooler water temperatures", ["Re-read the L.O.-cooler water inlet and outlet thermometers."]),
+    "loc_o": ("L.O.-cooler oil temperatures", ["Re-read the L.O. temperatures before and after the cooler (and the cooling-water inlet)."]),
+    "air": ("Charge-air temperatures", ["Re-read the charge-air temperature after the air cooler and the cooling-water temperature entering it; "
+                                        "check the thermometer / sensor."]),
+    "sea": ("Cooling water versus sea water", ["Re-read the low-temperature cooling-water and the sea-water temperatures."]),
+    "tc": ("Turbocharger and exhaust temperatures", ["Re-read the T/C inlet and outlet thermometers and the cylinder exhaust thermocouples "
+                                                    "(same load, same time).", "If they are confirmed, a very small temperature drop across the turbine points to a fouled "
+                                                    "turbine / nozzle ring or an exhaust leak: inspect and water-wash / clean the turbine side."]),
+    "bearing": ("Generator bearing temperatures", ["Check the bearing temperature sensors / thermometers and re-read them."]),
+}
 
-    # ---- per-cylinder deviations ----
-    m_exh, m_pm, m_rk, m_inj = _mean(df["exh"]), _mean(df["pmax"]), _mean(df["rack"]), _mean(df["inj"])
-    df["exh_dev"] = df["exh"] - m_exh if m_exh is not None else None
-    df["pmax_dev_pct"] = (df["pmax"] - m_pm) / m_pm * 100 if m_pm else None
-    df["rack_dev_pct"] = (df["rack"] - m_rk) / m_rk * 100 if m_rk else None
-    df["inj_dev"] = df["inj"] - m_inj if m_inj is not None else None
 
-    # ---- load of the test ----
-    if L is not None:
-        if L < 0.25:
-            F.append(_f("warning", f"Performance test at only {L * 100:.0f} % load",
-                        f"The sheet was recorded at {p['test']['raw']} ({L * 100:.0f} % of the {p['identity']['rated_kw']:.0f} kW rated output). Temperatures, Pmax and rack "
-                        "readings at this load are not representative of normal operation and comparisons with the shop trial are extrapolations.",
-                        "Repeat the test at the maximum safe load (≥ 50 %, ideally 75 %) as the form requires.", cat="load"))
-        elif L < th["low_load"]:
-            F.append(_f("advisory", f"Part-load test · {L * 100:.0f} % of rated",
-                        f"Recorded at {p['test']['raw']} ({L * 100:.0f} % of rated). Below {th['low_load'] * 100:.0f} % the readings are of limited value for trending.",
-                        "Prefer the maximum safe load for the monthly test so months are comparable.", cat="load"))
-    else:
-        F.append(_f("advisory", "Tested load unknown", "The load could not be derived from the sheet, so load-dependent comparisons were skipped.",
-                    "Check the 'TESTED AT MAX. SAFE LOAD' entry and the rated output.", cat="load"))
+def check_pairs(c: Ctx) -> None:
+    """Physical direction checks between two readings (cooler in/out, air before/after cooler, T/C versus cylinders ...)."""
+    bad: dict[str, list] = {}
+    for grp, hot, cold, gap_min, why in PAIR_RULES:
+        a, b = c.reading(hot), c.reading(cold)
+        if a is None or b is None:
+            continue
+        c.checks_run += 1
+        gap = a - b
+        if gap >= gap_min:
+            continue
+        impossible = gap < min(gap_min, 0)
+        bad.setdefault(grp, []).append(dict(hot=hot, cold=cold, a=a, b=b, gap=gap, why=why, impossible=impossible))
+    for grp, items in bad.items():
+        title, steps = PAIR_GROUPS[grp]
+        lines, seen = [], set()
+        for x in items:
+            if x["why"] in seen:
+                lines.append(f"{LABELS[x['hot']]} {_g(x['a'])} °C and {LABELS[x['cold']]} {_g(x['b'])} °C (difference {_g(x['gap'])} °C).")
+            else:
+                seen.add(x["why"])
+                lines.append(f"{LABELS[x['hot']]} {_g(x['a'])} °C and {LABELS[x['cold']]} {_g(x['b'])} °C (difference {_g(x['gap'])} °C): {x['why']}.")
+        keys = {k for x in items for k in (x["hot"], x["cold"]) if k != "exh_mean"}
+        sev = "warning" if any(x["impossible"] for x in items) else "advisory"
+        c.add(sev, f"Check entry · {title.lower()}", "\n".join(lines), [*steps, FIX_SHEET], topic="data", uses=sorted(keys), cells=c.cells(*sorted(keys)))
 
-    # ---- exhaust ----
+
+def check_header(c: Ctx) -> None:
+    """Load / current / rating / date / fuel entries that cannot be right."""
+    i, t, v = c.i, c.p["test"], c.v
+    cells_t = c.p["test"].get("ref") or ""
+    # kW against amps: even at the extremes of the usual voltage range the power factor must lie between 0.5 and 1.0
+    if t.get("kw") and t.get("amps"):
+        c.checks_run += 1
+        pf_hi, pf_lo = t["kw"] / (1.732 * 380 * t["amps"] / 1000), t["kw"] / (1.732 * 480 * t["amps"] / 1000)
+        if pf_lo > 1.0:
+            c.add("warning", "Check entry · generator current too low for the power", f"{t['kw']:g} kW at only {t['amps']:g} A would need a power factor above 1.0 "
+                  f"(at 380-480 V).", ["Re-read the generator kW and ampere meters.", FIX_SHEET], topic="data", uses=["load"])
+        elif pf_hi < 0.5:
+            c.add("warning", "Check entry · generator current too high for the power", f"{t['kw']:g} kW at {t['amps']:g} A would mean a power factor below 0.5 "
+                  f"(at 380-480 V).", ["Re-read the generator kW and ampere meters.", FIX_SHEET], topic="data", uses=["load"])
+    kw_r, kva_r = i.get("rated_kw"), i.get("rated_kva")
+    if kw_r and kva_r:
+        c.checks_run += 1
+        if not 0.6 <= kw_r / kva_r <= 1.0:
+            c.add("advisory", "Check entry · rated output", f"{kw_r:g} kW / {kva_r:g} kVA is a power factor of {kw_r / kva_r:.2f}; generators are normally rated at 0.8.",
+                  ["Compare with the generator name-plate.", FIX_SHEET], topic="data")
+    if c.L is not None and c.L > 1.05:
+        c.add("advisory", "Check entry · tested load above the rating", f"The test was recorded at {_pct(c.L)} of the {i.get('rated_kw') or 0:g} kW rating ({cells_t}).",
+              ["Check the kW reading and the rated output.", FIX_SHEET], topic="data", uses=["load"])
+    d = i.get("date")
+    if d:
+        c.checks_run += 1
+        age = (dt.date.today() - d).days
+        if age < -1:
+            c.add("warning", "Check entry · report date in the future", f"The report is dated {d:%d %b %Y}.", ["Correct the date on the sheet.", FIX_SHEET], topic="data")
+        elif age > 400:
+            c.add("advisory", "Check entry · report is more than a year old", f"The report is dated {d:%d %b %Y}.", ["Check the date, or use a current report."], topic="data")
+    rho = i.get("density")
+    if rho is not None:
+        c.checks_run += 1
+        if not 0.80 <= rho <= 1.10:
+            c.add("advisory", "Check entry · fuel density", f"Density {rho:g} is outside the usual 0.80-1.10 t/m³ (a value in kg/m³ was probably typed).",
+                  ["Enter the density in t/m³ (for example 0.98).", FIX_SHEET], topic="data")
+    rpm = i.get("rpm")
+    if rpm is not None:
+        c.checks_run += 1
+        if not 300 <= rpm <= 1900:
+            c.add("advisory", "Check entry · engine speed", f"{rpm:g} rpm is not a usual generator-set speed.", ["Check the rpm entry.", FIX_SHEET], topic="data")
+    mode = (c.p["texts"]["act"].get("fuel_mode") or "").upper()
+    fo_t, tank = v.get("fo_t_in"), v.get("hfo_tank_t")
+    if fo_t is not None and tank is not None and mode.startswith("HFO"):
+        c.checks_run += 1
+        if fo_t < tank - 5:
+            c.add("advisory", "Check entry · fuel temperatures", f"Fuel at the engine inlet ({fo_t:g} °C) is colder than the service tank heating ({tank:g} °C); "
+                  "the heater should only add heat.", ["Re-read both temperatures.", FIX_SHEET], topic="data", uses=["fo_t_in", "hfo_tank_t"])
+    ex = [x for x in c.df["exh"] if _ok(x)]
+    if len(ex) >= 4:
+        c.checks_run += 1
+        if len(set(ex)) == 1:
+            c.add("advisory", "Check entry · identical exhaust temperatures", f"All {len(ex)} cylinders show exactly {ex[0]:g} °C - real engines never do; the same value was probably copied.",
+                  ["Read every cylinder separately.", FIX_SHEET], topic="data", uses=["exh"])
+
+
+def check_ranges(c: Ctx) -> None:
+    """Readings outside any physically believable range (typing slips such as 720 instead of 72)."""
+    out = []
+    for k, x in c.v.items():
+        if x is None or k not in PLAUSIBLE:
+            continue
+        c.checks_run += 1
+        lo, hi = PLAUSIBLE[k]
+        if not lo <= x <= hi:
+            out.append((k, f"{PARAMS[k][0]} {x:g} {PARAMS[k][1]} (believable range {lo:g}-{hi:g})"))
+    for m, arr in c.p["cyl"]["act"].items():
+        for i, x in arr.items():
+            if x is None:
+                continue
+            c.checks_run += 1
+            lo, hi = CYL_PLAUSIBLE["pmax_bar" if m == "pmax" else m]
+            xx = x * c.p["units"]["pmax_factor"] if m == "pmax" else x
+            if not lo <= xx <= hi:
+                out.append((m, f"{CYL_METRICS[m][0]}, cylinder {i}: {x:g}"))
+    if out:
+        c.add("warning", "Check entry · readings outside the believable range", "; ".join(t for _, t in out) + ".",
+              ["Re-read these instruments, and check the decimal point and the unit.", FIX_SHEET], topic="data", uses=sorted({k for k, _ in out}),
+              cells=c.cells(*[k for k, _ in out if k in c.v]))
+
+
+def check_sheet_arithmetic(c: Ctx) -> None:
+    for x in c.p["xval"].values():
+        if x["group"] == "act":
+            c.checks_run += 1
+            if x["label"] in ("weak", "mismatch"):
+                c.add("advisory", f"Check entry · {CYL_LABEL[x['metric']]} average on the sheet", f"Printed average {x['doc']:g}, calculated from the cylinders {x['calc']:.2f}.",
+                      ["A cylinder reading was mis-typed or the average was mis-calculated: compare with the original log.", FIX_SHEET], topic="data", uses=[x["metric"]])
+
+
+def check_shop_block(c: Ctx) -> None:
+    """The shop-trial block is typed in by hand too: wrong load points and impossible values are reported here."""
+    bad_pts = [(g, d) for g, d in c.loads.items() if d["status"] in ("corrected", "non_standard", "as_printed")]
+    if bad_pts:
+        c.checks_run += 1
+        std = " and ".join(_pct(s) for s in parse_points(c.th["shop_points"]))
+        lines = [f"Block {'A' if g == 'shopA' else 'B'}: {d['note']}." for g, d in bad_pts]
+        used = " and ".join(_pct(d["used"]) for d in c.loads.values() if d["used"] is not None)
+        tail = (f" The comparison below uses {used}." if c.th["shop_mode"] == "auto" and any(d["status"] == "corrected" for _, d in bad_pts)
+                else " The comparison below uses the loads as typed.")
+        c.add("warning", "Check entry · shop-trial load points", f"The shop trials were run at {std} load. " + " ".join(lines) + tail,
+              ["Copy the two load points exactly as printed in the maker's shop-trial report - not the load of today's test.", FIX_SHEET],
+              topic="data", uses=["shop"], cells=", ".join(c.p["shop"][g]["ref"] for g, _ in bad_pts if c.p["shop"][g].get("ref")))
+    c.checks_run += len(c.ref)
+    bad = [r for r in c.ref if r["method"] == "inconsistent"]
+    if bad:
+        names = "; ".join(f"{r['label']} ({_g(r['shopA'])} → {_g(r['shopB'])} {r['unit']})" for r in bad)
+        c.add("advisory", "Check entry · shop-trial figures look wrong",
+              f"These shop-trial readings do not behave like real engine data between the two load points: {names}. They were not used as a reference.",
+              ["Copy the shop-trial figures again from the maker's test report.", FIX_SHEET], topic="data", uses=["shop"])
+
+
+def check_inputs(c: Ctx) -> None:
+    check_pairs(c)
+    check_header(c)
+    check_ranges(c)
+    check_sheet_arithmetic(c)
+    check_shop_block(c)
+
+
+# ───────────────────────────── B. engine findings ─────────────────────────────
+CYL_LABEL = {"exh": "exhaust", "pmax": "Pmax", "rack": "fuel rack"}
+
+
+def check_load(c: Ctx) -> None:
+    L, th = c.L, c.th
+    raw = c.p["test"]["raw"]
+    if L is None:
+        c.add("advisory", "Tested load unknown", "The load could not be derived from the sheet, so load-dependent comparisons were skipped.",
+              ["Check the 'TESTED AT MAX. SAFE LOAD' entry and the rated output.", FIX_SHEET], topic="data", uses=["load"])
+    elif L < 0.25:
+        c.add("warning", f"Performance test at only {L * 100:.0f} % load",
+              f"The sheet was recorded at {raw} ({L * 100:.0f} % of the {c.i['rated_kw'] or 0:.0f} kW rating). Temperatures, Pmax and rack at this load are not "
+              "representative and comparisons with the shop trial become extrapolations.",
+              ["Repeat the test at the maximum safe load (at least 50 %, ideally 75 %) as the form requires."], topic="load", when="retest")
+    elif L < th["low_load"]:
+        c.add("advisory", f"Part-load test · {L * 100:.0f} % of rated",
+              f"Recorded at {raw} ({L * 100:.0f} % of rated). Below {th['low_load'] * 100:.0f} % the readings are of limited value for trending.",
+              ["Prefer the maximum safe load for the monthly test so that months can be compared."], topic="load")
+
+
+def check_cylinders(c: Ctx) -> None:
+    th, df, m = c.th, c.df, c.m
     for _, r in df.iterrows():
-        i = int(r["id"])
-        e = r["exh"]
-        if e == e and e is not None:
+        i, e, d = int(r["id"]), r["exh"], r["exh_dev"]
+        if _ok(e):
             if e >= th["exh_abs_crit"]:
-                F.append(_f("critical", f"Cyl {i} · exhaust {e:.0f} °C", f"Above the critical limit of {th['exh_abs_crit']:.0f} °C.",
-                            "Reduce load and investigate immediately: exhaust valve condition, injector, turbocharger / air cooler fouling.", i, "exhaust"))
+                c.add("critical", f"Cyl {i} · exhaust {e:.0f} °C", f"Above the critical limit of {th['exh_abs_crit']:.0f} °C.",
+                      ["Reduce the load on this generator now and transfer load if possible.", "Confirm the reading on a second instrument, then find the cause: injector, exhaust "
+                       "valve seating, air cooler and turbocharger condition."],
+                      ["Leaking or burnt exhaust valve", "Late combustion (injector, fuel pump, timing)", "Too little charge air: dirty air cooler or turbocharger", "Overload"],
+                      i, "exhaust", uses=["exh"])
             elif e >= th["exh_abs"]:
-                F.append(_f("warning", f"Cyl {i} · high exhaust {e:.0f} °C", f"At or above the {th['exh_abs']:.0f} °C limit.",
-                            "Check scavenge/charge air temperature, air cooler and T/C condition, injection timing and exhaust valve seating.", i, "exhaust"))
-            d = r["exh_dev"]
-            if d == d and d is not None:
-                if abs(d) >= th["exh_dev_crit"]:
-                    hi = d > 0
-                    F.append(_f("mechanical", f"Cyl {i} · exhaust {d:+.0f} °C vs mean", f"{e:.0f} °C against an engine mean of {m_exh:.0f} °C (limit ±{th['exh_dev_crit']:.0f} °C).",
-                                "Late combustion / leaking exhaust valve / worn injector on this unit - overhaul candidate." if hi else
-                                "Low exhaust on one unit: blocked or weak injector, low fuel delivery, or a faulty thermocouple - confirm the sensor first.", i, "exhaust"))
-                elif abs(d) >= th["exh_dev"]:
-                    F.append(_f("warning", f"Cyl {i} · exhaust {d:+.0f} °C vs mean", f"{e:.0f} °C against an engine mean of {m_exh:.0f} °C (limit ±{th['exh_dev']:.0f} °C).",
-                                "Compare injector / fuel-pump condition and timing with the other cylinders; confirm the thermocouple.", i, "exhaust"))
-    # ---- Pmax ----
-    for _, r in df.iterrows():
+                c.add("warning", f"Cyl {i} · high exhaust {e:.0f} °C", f"At or above the {th['exh_abs']:.0f} °C limit.",
+                      ["Check the charge-air temperature, the air cooler (air and water side) and the turbocharger condition.", "Check injection timing and the injector of the hot cylinder(s)."],
+                      ["Dirty air cooler or turbocharger", "High charge-air or cooling-water temperature", "Injector or timing", "Exhaust valve seating"], i, "exhaust", uses=["exh"])
+        if _ok(d):
+            hi = d > 0
+            if abs(d) >= th["exh_dev_crit"]:
+                c.add("mechanical", f"Cyl {i} · exhaust {d:+.0f} °C vs mean", f"{e:.0f} °C against an engine mean of {m['exh']:.0f} °C (limit ±{th['exh_dev_crit']:.0f} °C).",
+                      (["Check the exhaust valve seating, injector and fuel pump of this cylinder; plan an overhaul if confirmed.", "Confirm the thermocouple first."] if hi else
+                       ["Confirm the thermocouple against a portable instrument.", "Test the injector and check the fuel pump of this cylinder."]),
+                      (["Late combustion", "Leaking exhaust valve", "Worn injector"] if hi else ["Blocked or weak injector", "Low fuel delivery (pump wear, rack)", "Faulty thermocouple"]),
+                      i, "exhaust", uses=["exh"])
+            elif abs(d) >= th["exh_dev"]:
+                c.add("warning", f"Cyl {i} · exhaust {d:+.0f} °C vs mean", f"{e:.0f} °C against an engine mean of {m['exh']:.0f} °C (limit ±{th['exh_dev']:.0f} °C).",
+                      ["Compare injector and fuel-pump condition and timing with the other cylinders.", "Confirm the thermocouple."],
+                      ["Injector or fuel-pump difference", "Thermocouple fault"], i, "exhaust", uses=["exh"])
         d = r["pmax_dev_pct"]
-        if d == d and d is not None and abs(d) >= th["pmax_dev"]:
+        if _ok(d) and abs(d) >= th["pmax_dev"]:
             sev = "warning" if abs(d) >= th["pmax_dev_warn"] else "advisory"
-            F.append(_f(sev, f"Cyl {int(r['id'])} · Pmax {d:+.1f} % vs mean", f"{r['pmax']:g} {unit_p} against a mean of {m_pm:.2f} {unit_p}.",
-                        "Low Pmax: retarded timing, injector or compression leakage. High Pmax: advanced timing or ignition quality. Re-measure before adjusting.", int(r["id"]), "pmax"))
-    # ---- rack ----
-    for _, r in df.iterrows():
+            c.add(sev, f"Cyl {i} · Pmax {d:+.1f} % vs mean", f"{r['pmax']:g} {c.p['units']['pmax']} against a mean of {m['pmax']:.2f}.",
+                  ["Re-measure Pmax on this cylinder to confirm.", "Check injection timing, injector and compression of this cylinder before adjusting anything."],
+                  (["Advanced injection timing", "Fuel pump delivering early"] if d > 0 else ["Retarded injection timing", "Injector or fuel-pump fault", "Compression leakage (rings, liner, valves)"]),
+                  i, "pmax", uses=["pmax"])
         d = r["rack_dev_pct"]
-        if d == d and d is not None and abs(d) >= th["rack_dev"]:
+        if _ok(d) and abs(d) >= th["rack_dev"]:
             sev = "warning" if abs(d) >= th["rack_dev_warn"] else "advisory"
-            F.append(_f(sev, f"Cyl {int(r['id'])} · fuel rack {d:+.1f} % vs mean", f"{r['rack']:g} mm against a mean of {m_rk:.2f} mm.",
-                        "Uneven fuel pump settings or wear: check the pump / injector calibration and the governor linkage.", int(r["id"]), "rack"))
-    # ---- injection timing ----
+            c.add(sev, f"Cyl {i} · fuel rack {d:+.1f} % vs mean", f"{r['rack']:g} mm against a mean of {m['rack']:.2f} mm.",
+                  ["Check the fuel pump and the rack linkage of this cylinder; calibrate the pump if needed.", "Compare the injector condition with the other cylinders."],
+                  (["Worn pump plunger / barrel (more rack needed for the same delivery)", "Rack linkage out of adjustment"] if d > 0
+                   else ["Pump delivering more per mm of rack (calibration)", "Linkage friction or sticking"]), i, "rack", uses=["rack"], when="soon" if sev == "warning" else "planned")
     sp = _spread(df["inj"])
     if sp is not None and sp >= th["inj_spread"]:
         sev = "warning" if sp >= th["inj_spread_warn"] else "advisory"
         lo_c = [int(i) for i, x in zip(df["id"], df["inj"]) if x == df["inj"].min()]
         hi_c = [int(i) for i, x in zip(df["id"], df["inj"]) if x == df["inj"].max()]
-        F.append(_f(sev, f"Injection timing differs by {sp:.1f}° between cylinders",
-                    f"Lowest {df['inj'].min():g}° BTDC (cyl {', '.join(map(str, lo_c))}), highest {df['inj'].max():g}° (cyl {', '.join(map(str, hi_c))}).",
-                    "Re-check the fuel pump timing marks / VIT setting of the outlying cylinders against the maker's value.", None, "timing"))
-    # ---- cooling / lube / fuel / generator ----
+        c.add(sev, f"Injection timing differs by {sp:.1f}° between cylinders",
+              f"Lowest {df['inj'].min():g}° BTDC (cyl {', '.join(map(str, lo_c))}), highest {df['inj'].max():g}° (cyl {', '.join(map(str, hi_c))}).",
+              ["Re-check the fuel pump timing marks / VIT setting of the outlying cylinders against the maker's value."],
+              ["Fuel pump timing set differently on the units"], None, "timing", uses=["inj"], when="planned")
+
+
+def check_plant(c: Ctx) -> None:
+    """Cooling water, lube oil, charge air, fuel, generator bearings and smoke."""
+    th, v = c.th, c.v
     jin, jout = v.get("cw_jacket_in"), v.get("cw_engine_out")
     if jout is not None and jout >= th["jacket_out_max"]:
-        F.append(_f("warning", f"Jacket cooling water outlet {jout:.0f} °C", f"Limit {th['jacket_out_max']:.0f} °C.", "Check the cooling water flow, thermostat and cooler fouling.", None, "cooling"))
+        c.add("warning", f"Jacket cooling water outlet {jout:.0f} °C", f"Limit {th['jacket_out_max']:.0f} °C.",
+              ["Check the cooling-water flow (pump, strainers, valves, air in the system).", "Check the thermostatic valve and the cooler."],
+              ["Low flow", "Thermostat / temperature controller", "Fouled cooler"], None, "cooling", uses=["cw_engine_out"])
     if jin is not None and jout is not None and jout - jin > 12:
-        F.append(_f("advisory", f"Jacket cooling water rise {jout - jin:.0f} °C", f"Inlet {jin:.0f} °C → outlet {jout:.0f} °C; typical rise is 5–10 °C.",
-                    "Check the circulating flow (pump, strainers, venting).", None, "cooling"))
+        c.add("advisory", f"Jacket cooling water rise {jout - jin:.0f} °C", f"Inlet {jin:.0f} °C → outlet {jout:.0f} °C; the usual rise is 5-10 °C.",
+              ["Check the jacket-water pump, strainers and venting."], ["Low circulating flow"], None, "cooling", uses=["cw_jacket_in", "cw_engine_out"])
     lo_o = v.get("lo_t_out")
     if lo_o is not None and lo_o >= th["lo_out_max"]:
-        F.append(_f("warning", f"L.O. cooler outlet {lo_o:.0f} °C", f"Limit {th['lo_out_max']:.0f} °C.", "Check the L.O. cooler (fouling / cooling water flow) and the thermostatic valve.", None, "lube"))
+        c.add("warning", f"L.O. cooler outlet {lo_o:.0f} °C", f"Limit {th['lo_out_max']:.0f} °C.",
+              ["Clean / check the L.O. cooler (oil and water side).", "Check the cooling-water flow to the cooler and the thermostatic valve."],
+              ["Fouled L.O. cooler", "Low cooling-water flow", "Thermostatic valve"], None, "lube", uses=["lo_t_out"])
     bc = v.get("ba_cyl_in")
     if bc is not None and bc >= th["boost_air_max"]:
-        F.append(_f("warning", f"Boost air at cylinder inlet {bc:.0f} °C", f"Limit {th['boost_air_max']:.0f} °C.", "Clean the air cooler (air and water side), check the air cooler cooling water temperature.", None, "air"))
+        c.add("warning", f"Boost air at cylinder inlet {bc:.0f} °C", f"Limit {th['boost_air_max']:.0f} °C.",
+              ["Clean the air cooler (air and water side).", "Check the temperature and flow of the cooling water entering the air cooler."],
+              ["Fouled air cooler", "Warm or insufficient cooling water"], None, "air", uses=["ba_cyl_in"])
     lp = v.get("lo_p_engine")
     if lp is not None:
         if lp < th["lo_p_min"] - 1.0:
-            F.append(_f("critical", f"L.O. pressure (engine) {lp:g} kgf/cm²", f"Well below the {th['lo_p_min']:g} kgf/cm² minimum.", "Stop and investigate: pump, filter differential, bearing wear, oil level.", None, "lube"))
+            c.add("critical", f"L.O. pressure (engine) {lp:g} kgf/cm²", f"Well below the {th['lo_p_min']:g} kgf/cm² minimum.",
+                  ["Unload / stop the engine and investigate: oil level, pump, filter differential, bearing wear."],
+                  ["Low oil level", "Pump or relief valve fault", "Blocked filter", "Worn bearings"], None, "lube", uses=["lo_p_engine"])
         elif lp < th["lo_p_min"]:
-            F.append(_f("warning", f"L.O. pressure (engine) {lp:g} kgf/cm²", f"Below the {th['lo_p_min']:g} kgf/cm² minimum.", "Check filter differential, oil temperature / viscosity and the pressure regulating valve.", None, "lube"))
+            c.add("warning", f"L.O. pressure (engine) {lp:g} kgf/cm²", f"Below the {th['lo_p_min']:g} kgf/cm² minimum.",
+                  ["Check the filter differential, the oil temperature / viscosity and the pressure regulating valve."],
+                  ["Dirty filter", "Hot, thin oil", "Regulating valve setting"], None, "lube", uses=["lo_p_engine"])
     lpt = v.get("lo_p_tc")
     if lpt is not None and lpt < th["lo_p_tc_min"]:
-        F.append(_f("warning", f"L.O. pressure (T/C) {lpt:g} kgf/cm²", f"Below the {th['lo_p_tc_min']:g} kgf/cm² minimum.", "Check the T/C oil supply line, filter and orifice.", None, "lube"))
+        c.add("warning", f"L.O. pressure (T/C) {lpt:g} kgf/cm²", f"Below the {th['lo_p_tc_min']:g} kgf/cm² minimum.",
+              ["Check the T/C oil supply line, filter and orifice."], ["Blocked supply line / orifice"], None, "lube", uses=["lo_p_tc"])
     fo_t = v.get("fo_t_in")
-    if fo_t is not None and (p["texts"]["act"].get("fuel_mode") or "").upper().startswith("HFO") and fo_t < 80:
-        F.append(_f("advisory", f"FO inlet temperature {fo_t:.0f} °C on HFO", "Low for heavy fuel - viscosity at the injectors may be too high.", "Check the heater and the viscosity controller set point.", None, "fuel"))
+    if fo_t is not None and (c.p["texts"]["act"].get("fuel_mode") or "").upper().startswith("HFO") and fo_t < 80:
+        c.add("advisory", f"FO inlet temperature {fo_t:.0f} °C on HFO", "Low for heavy fuel - the viscosity at the injectors may be too high.",
+              ["Check the heater and the viscosity controller set point."], ["Heater or viscosity-controller fault"], None, "fuel", uses=["fo_t_in"])
     for k, lab in (("gen_brg_de", "engine side"), ("gen_brg_nde", "opposite side")):
         b = v.get(k)
         if b is not None and b >= th["brg_max"]:
-            F.append(_f("warning", f"Generator bearing ({lab}) {b:.0f} °C", f"Limit {th['brg_max']:.0f} °C.", "Check bearing lubrication, alignment and cooling; inspect the bearing.", None, "generator"))
-    sm = _smoke_class(p["texts"]["act"].get("smoke"))
-    sm_raw = p["texts"]["act"].get("smoke")
+            c.add("warning", f"Generator bearing ({lab}) {b:.0f} °C", f"Limit {th['brg_max']:.0f} °C.",
+                  ["Check bearing lubrication, alignment and cooling; inspect the bearing."], ["Lubrication", "Misalignment", "Cooling"], None, "generator", uses=[k])
+    sm, raw = _smoke_class(c.p["texts"]["act"].get("smoke")), c.p["texts"]["act"].get("smoke")
     if sm == "black":
-        F.append(_f("warning", f"Exhaust smoke: {sm_raw}", "Dark smoke indicates poor combustion or overload.", "Check the air supply (air cooler, T/C), injectors and fuel quality.", None, "smoke"))
+        c.add("warning", f"Exhaust smoke: {raw}", "Dark smoke indicates poor combustion or overload.",
+              ["Check the air supply (air cooler, turbocharger), the injectors and the fuel quality."], ["Too little air", "Injector fault", "Poor fuel"], None, "smoke")
     elif sm == "blue":
-        F.append(_f("advisory", f"Exhaust smoke: {sm_raw}", "Blue smoke points to lube oil in the combustion chamber.", "Check the piston rings / liners and the lube-oil consumption trend.", None, "smoke"))
+        c.add("advisory", f"Exhaust smoke: {raw}", "Blue smoke points to lube oil in the combustion chamber.",
+              ["Check the piston rings / liners and watch the lube-oil consumption."], ["Worn rings or liner", "Valve guide leakage"], None, "smoke")
     elif sm in ("white", "brown"):
-        F.append(_f("advisory", f"Exhaust smoke: {sm_raw}", "Visible smoke colour noted on the sheet.", "Review at the next test - white: unburned fuel / water / cold running; brown: slightly rich or part-load combustion.", None, "smoke"))
+        c.add("advisory", f"Exhaust smoke: {raw}", "A visible smoke colour is noted on the sheet.",
+              ["Review at the next test: white = unburned fuel / water / cold running; brown = slightly rich or part-load combustion."], (), None, "smoke")
 
-    # ---- shop-trial reference ----
-    ref = shop_reference(p, th)
-    bad_ref = [r for r in ref if r["method"] == "inconsistent"]
-    trust_low = any(r["core"] for r in bad_ref)
-    if bad_ref:
-        names = "; ".join(f"{r['label'].lower()} (A {r['shopA']:.4g} → B {r['shopB']:.4g} {r['unit']})" for r in bad_ref)
-        F.append(_f("advisory", "Shop-trial block looks inconsistent",
-                    f"These readings fall while the shop-trial load rises, which is not physical: {names}. They were not used as a reference.",
-                    "Re-copy the shop-trial figures from the maker's test report. Other shop-trial comparisons on this sheet are treated as indicative only.", None, "data"))
-    for r in ref:
+
+REF_ADVICE = {   # key -> (causes if above reference, causes if below, action if above, action if below)
+    "exh_mean": (["Dirty air cooler or turbocharger", "Injection timing", "Exhaust valve seating", "High ambient / cooling-water temperature"], ["Thermocouple fault", "Load reading too high"],
+                 "Check the air cooler and turbocharger for fouling, the injection timing and the exhaust valve seating.", "Check the thermocouples and the load reading."),
+    "pmax_mean": (["Advanced timing", "High ignition quality fuel"], ["Retarded timing", "Injector or compression leakage"],
+                  "Check the fuel pump timing / VIT setting.", "Check the fuel pump timing and the compression (rings, liner, valves)."),
+    "rack_mean": (["Worn fuel pumps / injectors", "Low calorific-value fuel", "Shop trials are usually run on MDO"], ["Load reading too high", "Rack calibration"],
+                  "Check the fuel pumps and injectors for wear and review the fuel quality.", "Check the load reading, the fuel quality and the rack calibration."),
+    "boost_p": (["Gauge / unit error", "High exhaust back-pressure", "Turbocharger running fast (restricted flow)"], ["Dirty air cooler or air filter", "Fouled turbocharger", "Gauge error"],
+                "Check the pressure gauge / transmitter calibration and units, the exhaust back-pressure and the turbocharger condition.",
+                "Check the air filter, the air cooler and the turbocharger for fouling."),
+}
+
+
+def check_reference(c: Ctx) -> None:
+    """Deviation from the shop-trial figures at the tested load."""
+    trust_low = any(r["method"] == "inconsistent" and r["core"] for r in c.ref)
+    for r in c.ref:
         if not r["core"] or r["ref"] is None or r["delta"] is None or r["tol"] is None:
             continue
         mag = abs(r["delta"]) if r["tol_kind"] == "abs" else abs(r["delta_pct"] or 0.0)
@@ -1164,72 +1508,161 @@ def analyze(p: dict, th: Optional[dict] = None) -> dict:
         sev = "warning" if (mag >= 1.8 * r["tol"] and r["method"] in ("interpolated", "single") and not trust_low) else "advisory"
         up = r["delta"] > 0
         dtxt = f"{r['delta']:+.0f} °C" if r["tol_kind"] == "abs" else f"{r['delta_pct']:+.1f} %"
-        extra = ""
-        if r["method"] == "extrapolated":
-            extra += f" Indicative only: {r['note']}."
-        if trust_low:
-            extra += " The shop-trial block on this sheet is partly inconsistent, so treat this as indicative."
-        advice = {
-            "exh_mean": ("Check air cooler and T/C fouling, injection timing, exhaust valve seating and ambient / cooling water temperature."
-                         if up else "Check the thermocouples and the load reading."),
-            "pmax_mean": ("Advanced timing or ignition quality - check the VIT / fuel pump timing." if up
-                          else "Retarded timing, injector / compression leakage - check timing and compression."),
-            "rack_mean": ("More fuel per kW than at the shop trial: low-CV fuel, injector / pump wear, extra losses (shop trials are usually run on MDO)." if up
-                          else "Less fuel than at the shop trial: check the load reading, fuel quality and rack calibration."),
-            "boost_p": ("Check the pressure gauge / transmitter calibration and units, exhaust back-pressure and the T/C condition." if up
-                        else "Check air cooler / filter fouling and T/C condition."),
-        }[r["key"]]
-        F.append(_f(sev, f"{r['label']} {dtxt} vs shop trial",
-                    f"{r['act']:.2f} {r['unit']} against {r['ref']:.2f} {r['unit']} expected at {L * 100:.0f} % load ({r['method']}).{extra}", advice, None, "reference"))
+        extra = (f" Indicative only: {r['note']}." if r["method"] == "extrapolated" else "") + \
+                (" Part of the shop-trial block on this sheet is inconsistent, so treat this as indicative." if trust_low else "")
+        if r["implied"] is not None and abs(r["implied"] - c.L) >= 0.08:
+            extra += f" On the shop-trial curve this reading corresponds to about {_pct(r['implied'])} load."
+        up_c, dn_c, up_a, dn_a = REF_ADVICE[r["key"]]
+        c.add(sev, f"{r['label']} {dtxt} vs shop trial", f"{r['act']:.2f} {r['unit']} against {r['ref']:.2f} {r['unit']} expected at {_pct(c.L)} load ({r['method']}).{extra}",
+              [up_a if up else dn_a, SAME_TEST], up_c if up else dn_c, None, "reference", uses=[r["key"], "shop", "load"], when="soon" if sev == "warning" else "retest")
 
-    # ---- data-consistency checks ----
-    tco, ex_m = v.get("tc_out"), m_exh
-    tpi, tpo = v.get("tc_pair_in"), v.get("tc_pair_out")
-    over = []
-    if tco is not None and ex_m is not None and tco > ex_m + 10:
-        over.append(f"T/C outlet {tco:.0f} °C")
-    if tpi is not None and ex_m is not None and tpi > ex_m + 30:
-        over.append(f"T/C inlet {tpi:.0f} °C (ΔT row)")
-    if over:
-        F.append(_f("advisory", "Check entry · turbocharger temperatures above the cylinder exhaust",
-                    f"{' and '.join(over)} exceed the mean cylinder exhaust temperature ({ex_m:.0f} °C); gas cools on its way through the exhaust system and turbine, so one set of readings is probably off.",
-                    "Verify the T/C thermocouples / entries and the cylinder exhaust thermocouples.", None, "data"))
-    if tco is not None and tpo is not None and abs(tco - tpo) > 15:
-        F.append(_f("advisory", "Check entry · T/C outlet readings disagree",
-                    f"The T/C outlet row ({tco:.0f} °C) and the ΔT row ({tpo:.0f} °C) differ by {abs(tco - tpo):.0f} °C.", "Re-read both thermometers.", None, "data"))
-    for key, x in p["xval"].items():
-        if x["group"] == "act" and x["label"] in ("weak", "mismatch"):
-            F.append(_f("advisory", f"Check entry · {CYL_LABEL[x['metric']]} average on the sheet", f"Printed average {x['doc']:g}, calculated {x['calc']:.2f}.",
-                        "A reading was mis-typed or the average was mis-calculated - compare with the original.", None, "data"))
 
-    # ---- sort, score, status ----
-    F.sort(key=lambda f: (-SEV_RANK[f["sev"]], f["cyl"] if f["cyl"] is not None else 99, f["title"]))
+def diagnose(c: Ctx) -> None:
+    """Combine the individual findings into probable causes - several symptoms pointing at one fault."""
+    th, v, df = c.th, c.v, c.df
+    n_hot = int((df["exh"] >= th["exh_abs"]).sum()) if len(df) else 0
+
+    def dev(key: str) -> Optional[float]:          # deviation from the shop-trial reference, in the unit its tolerance is given in
+        r = c.usable_ref(key)
+        return None if r is None else (r["delta"] if r["tol_kind"] == "abs" else r["delta_pct"])
+    d_exh, d_boost, d_rack, d_pmax = dev("exh_mean"), dev("boost_p"), dev("rack_mean"), dev("pmax_mean")
+    exh_hi = (d_exh is not None and d_exh >= th["ref_exh"]) or (len(df) > 0 and n_hot >= max(1, len(df) // 2))
+    boost_lo = d_boost is not None and d_boost <= -th["ref_boost"]
+    air_hot = v.get("ba_cyl_in") is not None and v["ba_cyl_in"] >= th["boost_air_max"]
+    rack_hi = d_rack is not None and d_rack >= th["ref_rack"]
+    pmax_lo = d_pmax is not None and d_pmax <= -th["ref_pmax"]
+
+    def add(sev, title, fault, causes, actions, uses):
+        c.add(sev, title, fault, actions, causes, None, "diagnosis", uses=uses)
+
+    if exh_hi and (boost_lo or air_hot):
+        add("warning", "Probable diagnosis · too little charge air (air cooler / turbocharger side)",
+            "Exhaust temperatures are high " + ("while boost pressure is low" if boost_lo else "and the air leaving the cooler is hot") + " - the engine is short of cool air.",
+            ["Fouled air cooler (air or water side)", "Fouled turbocharger (compressor / turbine) or dirty air filter", "Warm or insufficient cooling water to the air cooler"],
+            ["Clean the air cooler and check the pressure drop across it.", "Water-wash the turbocharger as per the maker's instructions and check the air filter.",
+             "Check the temperature and flow of the cooling water entering the air cooler."], ["exh", "ba_cyl_in", "boost_p", "shop"])
+    if exh_hi and rack_hi:
+        add("warning", "Probable diagnosis · the engine burns more fuel than at the shop trial",
+            "High exhaust temperature together with more fuel rack than the shop trial needs at this load.",
+            ["Worn fuel pump plungers / injectors", "Poor-quality or low-calorific fuel", "Fouling or friction losses"],
+            ["Test the injectors and check the fuel pumps for wear.", "Review the fuel quality (calorific value, density, CCAI) and the fuel temperature."], ["exh", "rack", "shop"])
+    if pmax_lo and (exh_hi or rack_hi):
+        add("warning", "Probable diagnosis · late or poor combustion",
+            "Peak pressure is below the shop-trial value while exhaust temperature or rack is high: the fuel burns late.",
+            ["Retarded injection timing", "Worn injectors or fuel pumps", "Poor ignition quality of the fuel"],
+            ["Check the injection timing / VIT setting.", "Test the injectors; review the fuel quality."], ["pmax", "exh", "rack", "shop"])
+    for _, r in df.iterrows():
+        if _ok(r["exh_dev"]) and r["exh_dev"] >= th["exh_dev"] and _ok(r["pmax_dev_pct"]) and r["pmax_dev_pct"] <= -th["pmax_dev"]:
+            i = int(r["id"])
+            add("mechanical", f"Probable diagnosis · fault on cylinder {i} (injector, exhaust valve or compression)",
+                f"Cylinder {i} runs hot on exhaust ({r['exh_dev']:+.0f} °C vs mean) with low peak pressure ({r['pmax_dev_pct']:+.1f} %): the fuel burns late or is lost.",
+                ["Leaking injector or worn nozzle", "Leaking or burnt exhaust valve", "Compression loss (rings, liner)"],
+                [f"Pull and test the injector of cylinder {i}.", f"Check the exhaust valve seating and the compression of cylinder {i} at the next opportunity."], ["exh", "pmax"])
+
+
+# ───────────────────────────── C. verdict and crew action list ─────────────────────────────
+VERDICT_LEVELS = {   # level -> (label, banner class, icon)
+    "act_now": ("Act now", "low", "⛔"), "inspect": ("Inspect and correct", "review", "🛠️"), "watch": ("Correct at the next opportunity", "review", "⚠️"),
+    "monitor": ("Monitor", "high", "👁️"), "normal": ("Normal", "ok", "✅"),
+}
+
+
+def build_plan(F: list[dict]) -> list[dict]:
+    """The crew action list: every distinct step once, most urgent first, with the findings that ask for it."""
+    steps: dict[str, dict] = {}
+    for order, f in enumerate(F):
+        for s in f["actions"]:
+            cur = steps.get(s)
+            if cur is None:
+                steps[s] = dict(step=s, when=f["when"], sev=f["sev"], because=[f["title"]], order=order)
+            else:
+                if f["title"] not in cur["because"]:
+                    cur["because"].append(f["title"])
+                if URGENCY[f["when"]][0] < URGENCY[cur["when"]][0]:
+                    cur["when"] = f["when"]
+                if SEV_RANK[f["sev"]] > SEV_RANK[cur["sev"]]:
+                    cur["sev"] = f["sev"]
+    return sorted(steps.values(), key=lambda s: (URGENCY[s["when"]][0], s["step"] == FIX_SHEET, -SEV_RANK[s["sev"]], s["order"]))
+
+
+def make_verdict(F: list[dict], n_checks: int) -> dict:
+    eng = [f for f in F if f["cat"] not in ("data", "diagnosis")]
+    data = [f for f in F if f["cat"] == "data"]
+    diag = [f for f in F if f["cat"] == "diagnosis"]
+    worst = max([SEV_RANK[f["sev"]] for f in eng + diag] or [1])
+    level = "act_now" if worst >= 5 else "inspect" if worst == 4 else "watch" if worst == 3 else "monitor" if worst == 2 else "normal"
+    top = [f["title"] for f in sorted(eng + diag, key=lambda f: -SEV_RANK[f["sev"]])[:3]]
+    if level == "normal":
+        head = "All readings are within the limits and consistent with the shop-trial figures."
+    else:
+        head = "Main points: " + "; ".join(top) + "."
+    d_warn = sum(1 for f in data if f["sev"] == "warning")
+    dq = "many" if d_warn >= 3 else "some" if (d_warn >= 1 or len(data) >= 2) else "reliable"
+    dq_text = {"reliable": "Entries look consistent", "some": f"{len(data)} entr{'y' if len(data) == 1 else 'ies'} to re-check",
+               "many": f"{len(data)} entries to re-check - treat the figures as provisional"}[dq]
+    return dict(level=level, label=VERDICT_LEVELS[level][0], cls=VERDICT_LEVELS[level][1], icon=VERDICT_LEVELS[level][2], headline=head,
+                data_quality=dq, data_text=dq_text, n_data=len(data), n_checks=n_checks, provisional=dq != "reliable")
+
+
+def missing_entries(p: dict) -> list[str]:
+    """Readings the sheet leaves empty or marks N/A - not an error, but the diagnosis cannot use them."""
+    out = []
+    for k, (lab, _) in PARAMS.items():
+        if p["kinds"]["act"].get(k) == "na":
+            out.append(lab + " (N/A)")
+    i = p["identity"]
+    for k, lab in (("viscosity", "Fuel viscosity"), ("lo_cons", "L.O. consumption"), ("fo_cons", "F.O. consumption"), ("ambient_t", "Ambient temperature"),
+                   ("sea_t", "Sea water temperature"), ("run_hours", "Running hours")):
+        if i.get(k) in (None, ""):
+            out.append(lab + " (blank)")
+    return out
+
+
+# ───────────────────────────── the analysis ─────────────────────────────
+def analyze(p: dict, th: Optional[dict] = None) -> dict:
+    th = {**TH_DEFAULT, **(th or {})}
+    c = Ctx(p, th)
+    c.loads = shop_loads(p, th)
+    c.ref = shop_reference(p, th, c.loads)
+    check_load(c)
+    check_cylinders(c)
+    check_plant(c)
+    check_reference(c)
+    diagnose(c)
+    check_inputs(c)
+    F = c.F
+
+    # an engine finding that rests on a reading that failed an input check is marked "verify first"
+    bad_keys = {k for f in F if f["cat"] == "data" for k in f["uses"]}
+    for f in F:
+        f["provisional"] = f["cat"] != "data" and bool(bad_keys & set(f["uses"]))
+    F.sort(key=lambda f: (f["cat"] == "data", f["cat"] != "diagnosis", -SEV_RANK[f["sev"]], f["cyl"] if f["cyl"] is not None else 99, f["title"]))
+
+    real = [f for f in F if f["cat"] not in ("data", "diagnosis")]
     weights = {"critical": 30, "mechanical": 14, "warning": 7, "advisory": 2.5}
-    pen = sum(weights.get(f["sev"], 0) for f in F if f["cat"] != "data")
-    pen += 0.5 * sum(1 for f in F if f["cat"] == "data")
-    score = 100.0 / (1.0 + pen / 40.0)
-    sevs = {f["sev"] for f in F}
-    if "critical" in sevs:
-        score = min(score, 74.0)
-    elif "mechanical" in sevs:
-        score = min(score, 84.0)
+    score = 100.0 / (1.0 + sum(weights[f["sev"]] for f in real) / 40.0)
+    sevs = {f["sev"] for f in real}
+    score = min(score, 74.0) if "critical" in sevs else min(score, 84.0) if "mechanical" in sevs else score
     score = int(round(max(0, min(100, score))))
     grade = "Excellent" if score >= 85 else "Good" if score >= 70 else "Needs attention" if score >= 50 else "Critical"
-    worst = {int(c): "nominal" for c in df["id"]}
-    for f in F:
+
+    df = c.df
+    worst = {int(i): "nominal" for i in df["id"]}
+    for f in real:
         if f["cyl"] in worst and SEV_RANK[f["sev"]] > SEV_RANK[worst[f["cyl"]]]:
             worst[f["cyl"]] = f["sev"]
     df["status"] = df["id"].map(worst)
-
-    mean = dict(exh=m_exh, pmax=m_pm, pmax_bar=_mean(df["pmax_bar"]), rack=m_rk, inj=m_inj)
-    spread = dict(exh=_spread(df["exh"]), pmax=_spread(df["pmax"]), rack=_spread(df["rack"]), inj=_spread(df["inj"]))
-    counts = {s: 0 for s in SEV_RANK}
-    for f in F:
-        counts[f["sev"]] += 1
-    return dict(df=df, mean=mean, spread=spread, findings=F, score=score, grade=grade, load=L, ref=ref, counts=counts, th=th, n=n)
+    counts = {s: sum(1 for f in real if f["sev"] == s) for s in SEV_RANK}
+    plan = build_plan(F)
+    return dict(df=df, mean=dict(c.m, pmax_bar=_mean(df["pmax_bar"])), spread=dict(exh=_spread(df["exh"]), pmax=_spread(df["pmax"]), rack=_spread(df["rack"]), inj=_spread(df["inj"])),
+                findings=F, score=score, grade=grade, load=c.L, ref=c.ref, counts=counts, th=th, n=p["n_cylinders"], shop=c.loads,
+                verdict=make_verdict(F, c.checks_run), plan=plan, missing=missing_entries(p))
 
 
-# ───────────────────────────── fleet / vessel helpers ─────────────────────────────
+# ====================================================================================================
+# 3. FLEET  -  comparing reports with each other (same vessel / same generator)
+# ====================================================================================================
+
 def dg_label(p: dict) -> str:
     i = p["identity"]
     return f"DG {i['dg_no']}" if i.get("dg_no") else "DG"
@@ -1241,19 +1674,27 @@ def summary_row(name: str, p: dict, an: Optional[dict]) -> dict:
                load=p["test"].get("load_frac"), run_hours=i.get("run_hours"), confidence=c["total"], level=c["level"], n=p["n_cylinders"])
     if an:
         row.update(score=an["score"], crit=an["counts"]["critical"] + an["counts"]["mechanical"], warn=an["counts"]["warning"], adv=an["counts"]["advisory"],
-                   exh=an["mean"]["exh"], exh_spread=an["spread"]["exh"], pmax_bar=an["mean"]["pmax_bar"], rack=an["mean"]["rack"], boost=p["values"]["act"].get("boost_p"))
+                   verdict=an["verdict"]["label"], n_data=an["verdict"]["n_data"], exh=an["mean"]["exh"], exh_spread=an["spread"]["exh"],
+                   pmax_bar=an["mean"]["pmax_bar"], rack=an["mean"]["rack"], boost=p["values"]["act"].get("boost_p"))
     return row
 
 
+# readings that belong to one engine (not to a shared system): the same value on engines at different loads is suspicious
+OWN_READINGS = ("cw_jacket_in", "cw_engine_out", "cw_ac_out", "cw_lo_in", "cw_lo_out", "lo_t_in", "lo_t_out", "lo_p_engine", "lo_p_tc", "ba_cyl_in",
+                "gen_brg_de", "gen_brg_nde")
+COMPARE_ACTION = "Compare air cooler, turbocharger, injectors and fuel pumps with the sister unit; repeat both tests at the same load."
+
+
 def peer_notes(items: list[tuple[str, dict, dict]], load_window: float = 0.12) -> list[dict]:
-    """Compare DGs of the same vessel (items: (name, parsed, analysis)).  -> [{vessel, dgs, text}]"""
+    """Compare generators of the same vessel (items: (name, parsed, analysis)).
+    -> [{vessel, dgs, about (the DGs the note concerns), text, sev, cat, action}]"""
     notes: list[dict] = []
     by_vessel: dict[str, list] = {}
     for name, p, an in items:
         by_vessel.setdefault((p["identity"].get("vessel") or name), []).append((name, p, an))
 
-    def add(vessel, dgs, text, sev="advisory"):
-        notes.append(dict(vessel=vessel, dgs=tuple(dgs), text=text, sev=sev))
+    def add(vessel, dgs, about, text, sev="advisory", cat="engine", action=COMPARE_ACTION):
+        notes.append(dict(vessel=vessel, dgs=tuple(dgs), about=tuple(about), text=text, sev=sev, cat=cat, action=action))
 
     for vessel, lst in by_vessel.items():
         for a in range(len(lst)):
@@ -1267,20 +1708,72 @@ def peer_notes(items: list[tuple[str, dict, dict]], load_window: float = 0.12) -
                 if abs(l1 - l2) <= load_window:
                     if e1 is not None and e2 is not None and abs(e1 - e2) >= 25:
                         hot, cold = (n1, n2) if e1 > e2 else (n2, n1)
-                        add(vessel, (n1, n2), f"{hot} runs {abs(e1 - e2):.0f} °C hotter on exhaust than {cold} at a similar load ({l1 * 100:.0f} % / {l2 * 100:.0f} %).", "warning")
+                        add(vessel, (n1, n2), (hot,), f"{hot} runs {abs(e1 - e2):.0f} °C hotter on exhaust than {cold} at a similar load ({l1 * 100:.0f} % / {l2 * 100:.0f} %).", "warning")
                     b1, b2 = p1["values"]["act"].get("boost_p"), p2["values"]["act"].get("boost_p")
                     if b1 and b2 and abs(b1 - b2) / max(b1, b2) >= 0.15:
                         lo, hi = (n1, n2) if b1 < b2 else (n2, n1)
-                        add(vessel, (n1, n2), f"{lo} boost pressure is {abs(b1 - b2) / max(b1, b2) * 100:.0f} % lower than {hi} at a similar load - compare air filters, coolers and T/C.")
+                        add(vessel, (n1, n2), (lo,), f"{lo} boost pressure is {abs(b1 - b2) / max(b1, b2) * 100:.0f} % lower than {hi} at a similar load - compare air filters, coolers and T/C.")
                     r1, r2 = a1["mean"]["rack"], a2["mean"]["rack"]
                     if r1 and r2 and abs(r1 - r2) / max(r1, r2) >= 0.10:
                         hi, lo = (n1, n2) if r1 > r2 else (n2, n1)
-                        add(vessel, (n1, n2), f"{hi} needs {abs(r1 - r2) / max(r1, r2) * 100:.0f} % more fuel rack than {lo} at a similar load.")
-                elif e1 is not None and e2 is not None:
-                    (lo_n, lo_l, lo_e), (hi_n, hi_l, hi_e) = sorted([(n1, l1, e1), (n2, l2, e2)], key=lambda t: t[1])
-                    if lo_e >= hi_e + 25:
-                        add(vessel, (n1, n2), f"{lo_n} runs hotter on exhaust ({lo_e:.0f} °C) than {hi_n} ({hi_e:.0f} °C) although it was tested at a much lower load "
-                                              f"({lo_l * 100:.0f} % vs {hi_l * 100:.0f} %) - abnormally hot for its load: check the air cooler, T/C and injection.", "warning")
+                        add(vessel, (n1, n2), (hi,), f"{hi} needs {abs(r1 - r2) / max(r1, r2) * 100:.0f} % more fuel rack than {lo} at a similar load.")
+                else:
+                    if e1 is not None and e2 is not None:
+                        (lo_n, lo_l, lo_e), (hi_n, hi_l, hi_e) = sorted([(n1, l1, e1), (n2, l2, e2)], key=lambda t: t[1])
+                        if lo_e >= hi_e + 25:
+                            add(vessel, (n1, n2), (lo_n,), f"{lo_n} runs hotter on exhaust ({lo_e:.0f} °C) than {hi_n} ({hi_e:.0f} °C) although it was tested at a much lower load "
+                                                           f"({lo_l * 100:.0f} % vs {hi_l * 100:.0f} %) - abnormally hot for its load: check the air cooler, T/C and injection.", "warning")
+                    # identical readings on engines running at different loads: probably copied from one engine to the other
+                    v1, v2 = p1["values"]["act"], p2["values"]["act"]
+                    same = [k for k in OWN_READINGS if v1.get(k) is not None and v1.get(k) == v2.get(k)]
+                    if len(same) >= 4:
+                        add(vessel, (n1, n2), (n1, n2), f"{n1} and {n2} report identical values for {len(same)} readings ({', '.join(PARAMS[k][0].lower() for k in same[:4])}"
+                                                        f"{' ...' if len(same) > 4 else ''}) although their loads differ ({l1 * 100:.0f} % vs {l2 * 100:.0f} %) - they were probably copied from one engine.",
+                            "advisory", "data", "Read each generator's own instruments; never copy readings from one generator to another.")
+    return notes
+
+
+def history_notes(items: list[tuple[str, dict, dict]], load_window: float = 0.12) -> list[dict]:
+    """Same generator, several dates: running hours must advance, and a drift at a similar load is flagged."""
+    notes: list[dict] = []
+    by_dg: dict[tuple, list] = {}
+    for name, p, an in items:
+        i = p["identity"]
+        if i.get("date") and i.get("dg_no"):
+            by_dg.setdefault(((i.get("vessel") or name), i["dg_no"]), []).append((i["date"], p, an))
+    for (vessel, _), lst in by_dg.items():
+        lst.sort(key=lambda t: t[0])
+        for (d1, p1, a1), (d2, p2, a2) in zip(lst, lst[1:]):
+            if d1 == d2:
+                continue
+            lab = dg_label(p2)
+            span = f"{d1:%d %b %Y} → {d2:%d %b %Y}"
+
+            def add(text, sev="advisory", cat="engine", action=COMPARE_ACTION):
+                notes.append(dict(vessel=vessel, dgs=(lab,), about=(lab,), text=text, sev=sev, cat=cat, action=action))
+            h1, h2 = p1["identity"].get("run_hours"), p2["identity"].get("run_hours")
+            if h1 is not None and h2 is not None:
+                days = (d2 - d1).days
+                if h2 < h1:
+                    add(f"{lab} running hours went down from {h1:,.0f} to {h2:,.0f} h ({span}).", "warning", "data", "Check both running-hour entries against the hour meter and the PMS record.")
+                elif h2 - h1 > days * 24 * 1.02 + 1:
+                    add(f"{lab} running hours rose by {h2 - h1:,.0f} h in {days} days ({span}) - more than the calendar allows.", "warning", "data",
+                        "Check both running-hour entries against the hour meter and the PMS record.")
+            l1, l2 = a1["load"], a2["load"]
+            if l1 is None or l2 is None or abs(l1 - l2) > load_window:
+                continue
+            e1, e2 = a1["mean"]["exh"], a2["mean"]["exh"]
+            if e1 is not None and e2 is not None and e2 - e1 >= 25:
+                add(f"{lab} mean exhaust temperature rose {e2 - e1:.0f} °C at a similar load ({span}).", "warning",
+                    action="Look for a fouled air cooler / turbocharger, injector wear or exhaust valve leakage since the previous test.")
+            r1, r2 = a1["mean"]["rack"], a2["mean"]["rack"]
+            if r1 and r2 and (r2 - r1) / r1 >= 0.08:
+                add(f"{lab} mean fuel rack rose {(r2 - r1) / r1 * 100:.0f} % at a similar load ({span}).", "advisory",
+                    action="The engine needs more fuel for the same load: check pump / injector wear and fuel quality.")
+            b1, b2 = p1["values"]["act"].get("boost_p"), p2["values"]["act"].get("boost_p")
+            if b1 and b2 and (b1 - b2) / b1 >= 0.12:
+                add(f"{lab} boost pressure fell {(b1 - b2) / b1 * 100:.0f} % at a similar load ({span}).", "advisory",
+                    action="Check the air filter, the air cooler and the turbocharger for fouling.")
     return notes
 
 
@@ -1298,6 +1791,7 @@ def fmt_value(p: dict, group: str, key: str):
 def flat_rows(p: dict, an: Optional[dict]) -> list[dict]:
     """Every extracted reading as one flat table (CSV export)."""
     ref = {r["key"]: r for r in (an["ref"] if an else [])}
+    shop = an["shop"] if an else {}
     rows: list[dict] = []
     i = p["identity"]
     for lab, val in (("Vessel", i["vessel"]), ("DG", i["dg_no"]), ("Maker", i["maker"]), ("Type", i["type"]), ("Serial no.", i["serial"]),
@@ -1306,11 +1800,12 @@ def flat_rows(p: dict, an: Optional[dict]) -> list[dict]:
                      ("Load fraction", p["test"]["load_frac"]), ("Fuel used", i["fuel_used"]), ("Density", i["density"]), ("Viscosity", i["viscosity"]),
                      ("Fuel oil cons. (24 h)", i["fo_cons"]), ("Lub oil cons. (24 h)", i["lo_cons"]), ("Ambient temperature", i["ambient_t"]),
                      ("Sea water temperature", i["sea_t"]), ("Prepared by", i["prepared_by"]),
-                     ("Shop-trial load A", p["shop"]["shopA"]["load"]), ("Shop-trial load B", p["shop"]["shopB"]["load"])):
+                     ("Shop-trial load A (typed)", p["shop"]["shopA"]["load"]), ("Shop-trial load B (typed)", p["shop"]["shopB"]["load"]),
+                     ("Shop-trial load A (used)", shop.get("shopA", {}).get("used")), ("Shop-trial load B (used)", shop.get("shopB", {}).get("used"))):
         rows.append(dict(section="Header", parameter=lab, unit="", actual=val, shop_a="", shop_b="", reference="", cell=""))
     for title, keys in PARAM_LAYOUT:
         for k in keys:
-            vals = [fmt_value(p, g, k) for g in ("act", "shopA", "shopB")]
+            vals = [fmt_value(p, g, k) for g in GROUPS]
             if all(x is None for x in vals):
                 continue
             r = ref.get(k)
@@ -1322,12 +1817,12 @@ def flat_rows(p: dict, an: Optional[dict]) -> list[dict]:
             rows.append(dict(section="Text entries", parameter=extra.replace("_", " "), unit="", actual=t, shop_a="", shop_b="", reference="", cell=p["refs"].get(f"act.{extra}", "")))
     for m, (lab, unit) in CYL_METRICS.items():
         for cid in range(1, p["n_cylinders"] + 1):
-            vals = [p["cyl"][g][m].get(cid) for g in ("act", "shopA", "shopB")]
+            vals = [p["cyl"][g][m].get(cid) for g in GROUPS]
             if all(x is None for x in vals):
                 continue
             rows.append(dict(section="Cylinders", parameter=f"{lab} · cyl {cid}", unit=unit or p["units"]["pmax"], actual=vals[0], shop_a=vals[1], shop_b=vals[2],
                              reference="", cell=p["cyl_ref"].get(f"act.{m}.{cid}", "")))
-    for m in ("exh", "pmax", "rack"):
+    for m in AVG_METRICS:
         for g, lab in (("act", "actual"), ("shopA", "shop A"), ("shopB", "shop B")):
             if m in p["avgs_doc"][g]:
                 rows.append(dict(section="Printed averages", parameter=f"{CYL_METRICS[m][0]} average ({lab})", unit=CYL_METRICS[m][1] or p["units"]["pmax"],
@@ -1336,8 +1831,9 @@ def flat_rows(p: dict, an: Optional[dict]) -> list[dict]:
 
 
 # ====================================================================================================
-# 3. UI
+# 4. UI
 # ====================================================================================================
+
 
 DASH = '<span class="dim">—</span>'
 
@@ -1351,8 +1847,8 @@ def init_state() -> None:
 
 
 def reset_thresholds() -> None:
-    for k in TH_DEFAULT:                       # dropping the key makes each widget fall back to its default value
-        st.session_state.pop(f"dg_th_{k}", None)
+    for k in [f"dg_th_{s[0]}" for s in TH_SPECS] + ["dg_shop_mode", "dg_shop_pts"]:
+        st.session_state.pop(k, None)             # dropping the key makes each widget fall back to its default value
 
 
 def clear_all() -> None:
@@ -1369,16 +1865,24 @@ def parse_cached(data: bytes):
         return None, f"Unexpected problem while reading the workbook ({type(e).__name__}). The file may be damaged."
 
 
+SHOP_MODES = {"auto": "Read typed loads as the standard points (recommended)", "printed": "Use the loads exactly as typed"}
+
+
 def render_sidebar_thresholds() -> dict:
     with st.sidebar:
         md('<div style="height:1px;background:var(--line);margin:1.1rem 0 .9rem"></div>'
            '<p class="lbl" style="margin-bottom:.4rem">Auxiliary engines · TEC-014</p>')
-        th = {}
+        th: dict = {}
+        with st.expander("Shop-trial load points"):
+            th["shop_mode"] = st.radio("Loads typed in the shop-trial columns", list(SHOP_MODES), format_func=SHOP_MODES.get, key="dg_shop_mode")
+            th["shop_points"] = st.text_input("Shop trials were run at (% load)", value=TH_DEFAULT["shop_points"], key="dg_shop_pts")
+            st.caption("The crew types the two shop-trial loads by hand and often enters the engine's own test load (e.g. 59 %) instead. "
+                       "A typed value close to one of these points is read as that point, and the sheet is flagged.")
         with st.expander("Aux. diagnostic thresholds"):
             for k, lab, step, fmt in TH_SPECS:
                 th[k] = st.number_input(lab, value=float(TH_DEFAULT[k]), step=step, format=fmt, key=f"dg_th_{k}")
             st.button("Reset to defaults", on_click=reset_thresholds, key="dg_reset_th")
-            st.caption("Limits are generic for medium-speed generator sets; adjust to the maker's values. Shop-trial comparisons use the two load points printed on each sheet.")
+            st.caption("Limits are generic for medium-speed generator sets; adjust to the maker's values.")
     return th
 
 
@@ -1449,8 +1953,9 @@ def render_empty() -> None:
     <div class="feat">
     <div class="card"><div class="fi">🧭</div><div class="fh">Reads by label</div><div class="fd">Crews insert and delete rows. Every field is found by its section and label, so a shifted layout cannot put a value in the wrong place.</div></div>
     <div class="card"><div class="fi">🛡️</div><div class="fh">Nothing lost silently</div><div class="fd">Every filled cell is mapped to a field, recognised as template text, or listed under "not mapped".</div></div>
-    <div class="card"><div class="fi">⚖️</div><div class="fh">Shop-trial reference</div><div class="fd">The test is compared with the shop-trial load points, interpolated to the tested load - and flagged when that reference is not trustworthy.</div></div>
-    <div class="card"><div class="fi">🔌</div><div class="fh">DG vs DG</div><div class="fd">Load all generators of a vessel together to spot the unit that runs hotter, needs more fuel or loses boost compared with its sisters.</div></div>
+    <div class="card"><div class="fi">🔎</div><div class="fh">Checks the entries</div><div class="fd">Cooler in / out reversed, air colder than its cooling water, T/C hotter than the cylinders, bearings colder than the room, wrong shop-trial loads: every sheet is tested against physics before it is trusted.</div></div>
+    <div class="card"><div class="fi">🛠️</div><div class="fh">Verdict and crew actions</div><div class="fd">One verdict, the probable causes and a prioritised action list for the engine room - compared with the shop-trial figures at the tested load.</div></div>
+    <div class="card"><div class="fi">🔌</div><div class="fh">DG vs DG</div><div class="fd">Load all generators of a vessel together to spot the unit that runs hotter, needs more fuel or loses boost - and readings copied from one engine to another.</div></div>
     </div>""")
 
 
@@ -1617,20 +2122,102 @@ def render_banner(p: dict) -> None:
             md(f'<div class="banner err"><div class="ic">⛔</div><div><div class="bt">Structure error</div><div class="bd">{esc(m)}</div></div></div>')
 
 
-def render_findings(an: dict, peers: list) -> None:
-    counts = dict(an["counts"])
-    for n in peers:
-        counts[n["sev"]] = counts.get(n["sev"], 0) + 1
-    chips = " ".join(chip(f"{counts[s]} {SEV_LABEL[s]}", SEV_CHIP[s]) for s in ("critical", "mechanical", "warning", "advisory") if counts.get(s))
-    md(f'<div style="margin-bottom:.7rem">{chips or chip("No findings", "ok")}</div>')
-    for n in peers:
-        md(f'<div class="fcard {n["sev"]}"><div class="ft"><span class="fh">Compared with the other generators</span>{chip(SEV_LABEL[n["sev"]], SEV_CHIP[n["sev"]])}</div>'
-           f'<div class="ff">{esc(n["text"])}</div><div class="fa"><b>Action</b>Compare air cooler, turbocharger, injectors and fuel pumps with the sister unit; repeat both tests at the same load.</div></div>')
-    for f in an["findings"]:
-        md(f'<div class="fcard {f["sev"]}"><div class="ft"><span class="fh">{esc(f["title"])}</span>{chip(SEV_LABEL[f["sev"]], SEV_CHIP[f["sev"]])}</div>'
-           f'<div class="ff">{esc(f["fault"])}</div><div class="fa"><b>Action</b>{esc(f["action"])}</div></div>')
-    if not an["findings"] and not peers:
+def _steps(items) -> str:
+    return "<br>".join(f"☐ {esc(a)}" for a in items)
+
+
+def finding_card(f: dict) -> str:
+    """One finding: what was seen, likely causes, what to do."""
+    if f["cat"] == "data":
+        tag = chip("Check entry", "warn" if f["sev"] == "warning" else "info")
+    elif f["cat"] == "diagnosis":
+        tag = chip("Probable diagnosis", SEV_CHIP[f["sev"]])
+    else:
+        tag = chip(SEV_LABEL[f["sev"]], SEV_CHIP[f["sev"]])
+    if f.get("provisional"):
+        tag += " " + chip("verify entry first", "warn")
+    causes = (f'<div class="ff" style="color:var(--muted);font-size:.84rem"><b style="color:var(--gold2);letter-spacing:.12em;font-size:.72rem;text-transform:uppercase">Likely causes</b> '
+              f'{" · ".join(esc(c) for c in f["causes"])}</div>') if f["causes"] else ""
+    cells = f'<div class="note" style="margin-bottom:4px">Sheet cells: {esc(f["cells"])}</div>' if f.get("cells") else ""
+    title = f["title"].removeprefix("Check entry · ") if f["cat"] == "data" else f["title"]
+    fault = "<br>".join(esc(x) for x in f["fault"].split("\n"))
+    return (f'<div class="fcard {f["sev"]}"><div class="ft"><span class="fh">{esc(title)}</span>{tag}</div><div class="ff">{fault}</div>{causes}{cells}'
+            f'<div class="fa"><b>Do</b><div style="margin-top:3px">{_steps(f["actions"])}</div><div class="note" style="margin-top:4px">{esc(URGENCY[f["when"]][1])}</div></div></div>')
+
+
+def note_card(n: dict) -> str:
+    tag = chip("Check entry", "warn" if n["sev"] == "warning" else "info") if n["cat"] == "data" else chip(SEV_LABEL[n["sev"]], SEV_CHIP[n["sev"]])
+    return (f'<div class="fcard {n["sev"]}"><div class="ft"><span class="fh">Compared with other reports</span>{tag}</div><div class="ff">{esc(n["text"])}</div>'
+            f'<div class="fa"><b>Do</b><div style="margin-top:3px">{_steps([n["action"]])}</div></div></div>')
+
+
+def render_verdict(an: dict) -> None:
+    v, c = an["verdict"], an["counts"]
+    dq_tone = {"reliable": "ok", "some": "warn", "many": "crit"}[v["data_quality"]]
+    chips = " ".join(chip(f"{c[s]} {SEV_LABEL[s]}", SEV_CHIP[s]) for s in ("critical", "mechanical", "warning", "advisory") if c.get(s)) or chip("No findings", "ok")
+    chips += " " + chip(v["data_text"], dq_tone)
+    prov = " · provisional" if v["provisional"] else ""
+    md(f'<div class="banner {v["cls"]}"><div class="ic">{v["icon"]}</div><div><div class="bt">{esc(v["label"])}{prov}</div><div class="bd">{esc(v["headline"])}'
+       + ('<br>Some entries on the sheet failed consistency checks - re-check them before relying on the figures.' if v["provisional"] else "")
+       + f'<div style="margin-top:.55rem">{chips}</div></div></div></div>')
+
+
+PLAN_TONE = {"recheck": "advisory", "now": "critical", "soon": "warning", "planned": "advisory", "retest": "nominal"}
+
+
+def render_plan(an: dict) -> None:
+    if not an["plan"]:
+        md('<div class="fcard nominal"><div class="ft"><span class="fh">No action needed</span></div><div class="ff">Nothing to correct. Repeat the performance test next month at the same load.</div></div>')
+        return
+    for key, (_, label) in sorted(URGENCY.items(), key=lambda kv: kv[1][0]):
+        items = [s for s in an["plan"] if s["when"] == key]
+        if not items:
+            continue
+        rows = "".join(f'<div class="ff">☐ {esc(s["step"])}<span class="note"> - {esc("; ".join(s["because"][:2]))}</span></div>' for s in items)
+        md(f'<div class="fcard {PLAN_TONE[key]}"><div class="ft"><span class="fh">{esc(label)}</span>{chip(str(len(items)), "gold")}</div>{rows}</div>')
+
+
+def render_checks(an: dict, p: dict, notes: list) -> None:
+    data = [f for f in an["findings"] if f["cat"] == "data"]
+    n_notes = [n for n in notes if n["cat"] == "data"]
+    v = an["verdict"]
+    md(f'<p class="note">{v["n_checks"]} consistency checks were run on the readings (cooler in / out direction, charge air versus cooling water, turbocharger versus cylinders, '
+       f'bearings versus ambient, kW versus amps, shop-trial loads and figures, printed averages). <b>{len(data) + len(n_notes)} flagged.</b></p>')
+    if not data and not n_notes:
+        md('<div class="fcard nominal"><div class="ft"><span class="fh">Entries look consistent</span></div><div class="ff">No reading failed a consistency check.</div></div>')
+    for f in data:
+        md(finding_card(f))
+    for n in n_notes:
+        md(note_card(n))
+    if an["missing"]:
+        md('<p class="note" style="margin-top:.4rem"><b>Not measured / left blank:</b> ' + esc(" · ".join(an["missing"])) + ". The diagnosis cannot use these.</p>")
+
+
+def render_findings(an: dict, notes: list) -> None:
+    eng = [f for f in an["findings"] if f["cat"] != "data"]
+    eng_notes = [n for n in notes if n["cat"] != "data"]
+    if not eng and not eng_notes:
         md('<div class="fcard nominal"><div class="ft"><span class="fh">All readings within limits</span></div><div class="ff">No deviations were found against the configured thresholds.</div></div>')
+    for n in eng_notes:
+        md(note_card(n))
+    for f in eng:
+        md(finding_card(f))
+
+
+def shop_panel(an: dict) -> str:
+    tone = {"standard": ("standard point", "ok"), "corrected": ("corrected", "warn"), "non_standard": ("not standard", "warn"), "as_printed": ("as typed", "info")}
+    rows, notes = [], []
+    for g, name in (("shopA", "Block A"), ("shopB", "Block B")):
+        d = an["shop"][g]
+        if d["printed"] is None:
+            rows.append([name, DASH, DASH, chip("no load typed", "info")])
+            continue
+        lab, tn = tone[d["status"]]
+        rows.append([name, f'{d["printed"] * 100:.0f} %', f'{d["used"] * 100:.0f} %', chip(lab, tn)])
+        if d["note"]:
+            notes.append(f'{name}: {esc(d["note"])}.')
+    return (table_html(["Shop-trial block", "Typed on the sheet", "Used for comparison", "Status"], rows)
+            + (f'<p class="note" style="margin-top:.4rem">{" ".join(notes)}</p>' if notes else ""))
 
 
 def _c(v, nd=1):
@@ -1661,9 +2248,10 @@ def ref_table(an: dict) -> str:
         meth = {"interpolated": chip("interpolated", "ok"), "extrapolated": chip("extrapolated", "warn"), "single": chip("single point", "info"),
                 "inconsistent": chip("inconsistent", "crit"), "out_of_range": chip("out of range", "warn"), "none": DASH}[r["method"]]
         dl = DASH if r["delta"] is None else (f'{r["delta"]:+.1f}' + (f' ({r["delta_pct"]:+.1f} %)' if r["delta_pct"] is not None else ""))
-        rows.append([esc(r["label"]) + (' <span class="dim">· core</span>' if r["core"] else ""), _c(r["act"], 2), _c(r["shopA"], 2), _c(r["shopB"], 2),
-                     _c(r["ref"], 2), dl, meth, esc(r["unit"])])
-    return table_html(["Parameter", "Actual", "Shop A", "Shop B", "Reference @ load", "Δ", "Method", "Unit"], rows)
+        imp = DASH if r.get("implied") is None else f'{r["implied"] * 100:.0f} %'
+        rows.append([f'{esc(r["label"])} <span class="dim">· {esc(r["unit"])}{" · core" if r["core"] else ""}</span>', _c(r["act"], 2), _c(r["shopA"], 2), _c(r["shopB"], 2),
+                     _c(r["ref"], 2), dl, imp, meth])
+    return table_html(["Parameter", "Actual", "Shop A", "Shop B", "Reference", "Δ", "Implied load", "Method"], rows)
 
 
 def _fv(p: dict, g: str, key: str) -> str:
@@ -1676,8 +2264,8 @@ def _fv(p: dict, g: str, key: str) -> str:
     return esc(t) if t else DASH
 
 
-def readings_tables(p: dict) -> None:
-    la, lb = p["shop"]["shopA"]["load"], p["shop"]["shopB"]["load"]
+def readings_tables(p: dict, an: Optional[dict] = None) -> None:
+    la, lb = (an["shop"]["shopA"]["used"], an["shop"]["shopB"]["used"]) if an else (p["shop"]["shopA"]["load"], p["shop"]["shopB"]["load"])
     ha = f"Shop A{f' · {la * 100:.0f} %' if la else ''}"
     hb = f"Shop B{f' · {lb * 100:.0f} %' if lb else ''}"
     for title, keys in PARAM_LAYOUT:
@@ -1744,43 +2332,58 @@ def export_json(rep: dict) -> bytes:
                cross_checks={k: {kk: vv for kk, vv in v.items() if kk != "tier"} for k, v in p["xval"].items()}, confidence=p["confidence"],
                coverage=p["coverage"], unmapped_cells=p["unclaimed"], source_cells=p["refs"], notes=[dict(severity=s, message=m) for s, m in p["issues"]])
     if an:
-        doc.update(health_score=an["score"], grade=an["grade"], findings=an["findings"], shop_trial_reference=an["ref"],
+        doc.update(health_score=an["score"], grade=an["grade"], verdict=an["verdict"], crew_actions=an["plan"], findings=an["findings"], shop_trial_loads_used=an["shop"],
+                   not_measured=an["missing"], shop_trial_reference=an["ref"],
                    cylinder_table=an["df"].where(an["df"].notna(), None).to_dict(orient="records"))
     return json.dumps(doc, indent=2, default=str, ensure_ascii=False).encode("utf-8")
 
 
-def export_html(rep: dict) -> bytes:
+def export_html(rep: dict, notes: Optional[list] = None) -> bytes:
+    """One printable page for the ship: verdict, action list, entries to re-check, findings, cylinders."""
     p, an = rep["parsed"], rep["an"]
-    i = p["identity"]
+    i, v = p["identity"], an["verdict"]
     unit = p["units"]["pmax"]
 
-    def f(v, nd=1):
-        return "—" if v is None or v != v else f"{v:.{nd}f}"
-    rows = "".join(f"<tr><td>{int(r['id'])}</td><td>{f(r['inj'])}</td><td>{f(r['exh'], 0)}</td><td>{f(r['pmax'], 2)}</td><td>{f(r['rack'])}</td><td>{SEV_LABEL[r['status']]}</td></tr>"
-                   for _, r in an["df"].iterrows())
-    fnd = "".join(f"<div class='f {x['sev']}'><b>{esc(x['title'])}</b><br>{esc(x['fault'])}<br><i>Action: {esc(x['action'])}</i></div>" for x in an["findings"])
+    def f(x, nd=1):
+        return "—" if x is None or x != x else f"{x:.{nd}f}"
+    cyl = "".join(f"<tr><td>{int(r['id'])}</td><td>{f(r['inj'])}</td><td>{f(r['exh'], 0)}</td><td>{f(r['pmax'], 2)}</td><td>{f(r['rack'])}</td><td>{SEV_LABEL[r['status']]}</td></tr>"
+                  for _, r in an["df"].iterrows())
+    plan = ""
+    for key, (_, label) in sorted(URGENCY.items(), key=lambda kv: kv[1][0]):
+        items = [s for s in an["plan"] if s["when"] == key]
+        if items:
+            plan += f"<h3>{esc(label)}</h3>" + "".join(f"<div class='st'>&#9744; {esc(s['step'])}<small> - {esc('; '.join(s['because'][:2]))}</small></div>" for s in items)
+    data = "".join(f"<div class='f advisory'><b>{esc(x['title'])}</b><br>{'<br>'.join(esc(l) for l in x['fault'].split(chr(10)))}" + (f"<br><small>Sheet cells: {esc(x['cells'])}</small>" if x.get("cells") else "") + "</div>"
+                   for x in an["findings"] if x["cat"] == "data")
+    data += "".join(f"<div class='f advisory'>{esc(n['text'])}</div>" for n in (notes or []) if n["cat"] == "data")
+    fnd = "".join(f"<div class='f {x['sev']}'><b>{esc(x['title'])}</b>{' (verify the entry first)' if x.get('provisional') else ''}<br>{esc(x['fault'])}"
+                  + (f"<br><small>Likely causes: {esc(' / '.join(x['causes']))}</small>" if x["causes"] else "") + "</div>" for x in an["findings"] if x["cat"] != "data")
     ref = "".join(f"<tr><td>{esc(r['label'])}</td><td>{f(r['act'], 2)}</td><td>{f(r['shopA'], 2)}</td><td>{f(r['shopB'], 2)}</td><td>{f(r['ref'], 2)}</td><td>{esc(r['method'])}</td></tr>" for r in an["ref"])
     load = f"{an['load'] * 100:.0f} %" if an["load"] is not None else "unknown"
-    page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Aux. engine report - {esc(i.get('vessel'))} {esc(dg_label(p))}</title><style>
-body{{font-family:Arial,Helvetica,sans-serif;color:#1b1b1b;margin:32px auto;max-width:900px}}h1{{margin:0;letter-spacing:.04em}}.sub{{color:#666;margin-bottom:18px}}
-table{{border-collapse:collapse;width:100%;margin:12px 0}}th,td{{border:1px solid #ccc;padding:6px 9px;text-align:right}}th{{background:#f3efe2}}td:first-child,th:first-child{{text-align:left}}
-.f{{border-left:5px solid #999;background:#fafafa;padding:8px 12px;margin:8px 0}}.f.critical{{border-color:#d33}}.f.warning{{border-color:#d9a500}}.f.mechanical{{border-color:#e07b2a}}.f.advisory{{border-color:#4a8ac4}}
-.k{{display:inline-block;margin-right:22px}}</style></head><body>
-<h1>{esc(i.get('vessel') or rep['name'])} - {esc(dg_label(p))} performance</h1>
+    shop = " and ".join(f"{d['used'] * 100:.0f} %" for d in an["shop"].values() if d["used"] is not None) or "-"
+    page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Aux. engine check - {esc(i.get('vessel'))} {esc(dg_label(p))}</title><style>
+body{{font-family:Arial,Helvetica,sans-serif;color:#1b1b1b;margin:28px auto;max-width:900px;font-size:14px}}h1{{margin:0;letter-spacing:.03em}}h3{{margin:18px 0 6px}}.sub{{color:#666;margin-bottom:14px}}
+table{{border-collapse:collapse;width:100%;margin:10px 0}}th,td{{border:1px solid #ccc;padding:5px 8px;text-align:right}}th{{background:#f3efe2}}td:first-child,th:first-child{{text-align:left}}
+.f{{border-left:5px solid #999;background:#fafafa;padding:7px 11px;margin:7px 0}}.f.critical{{border-color:#d33}}.f.warning{{border-color:#d9a500}}.f.mechanical{{border-color:#e07b2a}}.f.advisory{{border-color:#4a8ac4}}
+.v{{border:2px solid #444;padding:10px 14px;margin:12px 0}}.st{{margin:4px 0}}small{{color:#666}}.k{{display:inline-block;margin-right:20px}}@media print{{body{{margin:10px}}}}</style></head><body>
+<h1>{esc(i.get('vessel') or rep['name'])} - {esc(dg_label(p))}: performance check and action sheet</h1>
 <div class="sub">{esc(i.get('maker'))} {esc(i.get('type'))} · S/N {esc(i.get('serial'))} · {esc(i.get('output_text'))} · test {esc(str(i.get('date') or ''))} {esc(i.get('time') or '')} · source {esc(rep['name'])} · M.E. Command Center v{APP_VERSION}</div>
+<div class="v"><b>Verdict: {esc(v['label'])}</b>{' (provisional)' if v['provisional'] else ''}<br>{esc(v['headline'])}<br><small>{esc(v['data_text'])}</small></div>
 <div><span class="k"><b>Health</b> {an['score']}/100 ({an['grade']})</span><span class="k"><b>Load</b> {load}</span><span class="k"><b>Exhaust mean</b> {f(an['mean']['exh'], 0)} °C</span>
 <span class="k"><b>Pmax mean</b> {f(an['mean']['pmax'], 2)} {esc(unit)}</span><span class="k"><b>Rack mean</b> {f(an['mean']['rack'])} mm</span></div>
-<h3>Cylinders</h3><table><tr><th>Cyl</th><th>Inj. ° BTDC</th><th>Exhaust °C</th><th>Pmax {esc(unit)}</th><th>Rack mm</th><th>Status</th></tr>{rows}</table>
-<h3>Versus shop trial</h3><table><tr><th>Parameter</th><th>Actual</th><th>Shop A</th><th>Shop B</th><th>Reference</th><th>Method</th></tr>{ref}</table>
-<h3>Findings</h3>{fnd or '<p>No findings.</p>'}
-<p style="color:#888;font-size:12px">Limits are generic and editable. Shop-trial figures are those printed on the sheet.</p></body></html>"""
+<h2>What to do</h2>{plan or '<p>No action needed. Repeat the test next month at the same load.</p>'}
+<h2>Entries to re-check on the sheet</h2>{data or '<p>No inconsistent entries found.</p>'}
+<h2>Findings</h2>{fnd or '<p>No findings.</p>'}
+<h3>Cylinders</h3><table><tr><th>Cyl</th><th>Inj. ° BTDC</th><th>Exhaust °C</th><th>Pmax {esc(unit)}</th><th>Rack mm</th><th>Status</th></tr>{cyl}</table>
+<h3>Versus shop trial (compared at {shop} load points)</h3><table><tr><th>Parameter</th><th>Actual</th><th>Shop A</th><th>Shop B</th><th>Reference</th><th>Method</th></tr>{ref}</table>
+<p style="color:#888;font-size:12px">Causes are indications drawn from the readings, not proof: the Chief Engineer decides. Limits are generic and editable; shop-trial figures are those printed on the sheet.</p></body></html>"""
     return page.encode("utf-8")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  report / overview
 # ═════════════════════════════════════════════════════════════════════════════
-def render_report(rep: dict, th: dict, peers_all: list) -> None:
+def render_report(rep: dict, th: dict, notes_all: list) -> None:
     rid = rep["id"]
     p, an = rep["parsed"], rep["an"]
     if not p:
@@ -1798,13 +2401,10 @@ def render_report(rep: dict, th: dict, peers_all: list) -> None:
         return
     lab = dg_label(p)
     vessel = p["identity"].get("vessel")
-    # a comparison note is shown once, on the generator it is about (the note starts with that generator's name)
-    peers = [n for n in peers_all if n["vessel"] == (vessel or rep["name"]) and n["text"].startswith(lab)]
-    L = an["load"]
-    t = p["test"]
-    sc = an["score"]
+    notes = [n for n in notes_all if n["vessel"] == (vessel or rep["name"]) and lab in n["about"]]     # comparison notes, shown on the DG they concern
+    L, t, sc, unit = an["load"], p["test"], an["score"], p["units"]["pmax"]
+    v = an["verdict"]
     tone = "ok" if sc >= 85 else "" if sc >= 70 else "warn" if sc >= 50 else "crit"
-    unit = p["units"]["pmax"]
     cards = [
         kpi("Engine health", f"{sc}", "/100", an["grade"], tone),
         kpi("Tested load", f"{L * 100:.0f}" if L is not None else "—", "%" if L is not None else "", f"{t['kw']:g} kW" + (f" · {t['amps']:g} A" if t.get("amps") else "") if t.get("kw") else "",
@@ -1812,13 +2412,28 @@ def render_report(rep: dict, th: dict, peers_all: list) -> None:
         kpi("Mean exhaust", _num(an["mean"]["exh"], 0), "°C" if an["mean"]["exh"] is not None else "", f"spread {_num(an['spread']['exh'], 0)} °C" if an["spread"]["exh"] is not None else ""),
         kpi("Mean Pmax", _num(an["mean"]["pmax_bar"], 1), "bar", f"{_num(an['mean']['pmax'], 2)} {unit} · spread {_num(an['spread']['pmax'], 2)}"),
         kpi("Mean fuel rack", _num(an["mean"]["rack"], 1), "mm", f"spread {_num(an['spread']['rack'], 1)} mm" if an["spread"]["rack"] is not None else ""),
-        kpi("Boost pressure", _num(p["values"]["act"].get("boost_p"), 2), "kgf/cm²"),
+        kpi("Boost pressure", _num(p["values"]["act"].get("boost_p"), 2), "", "kgf/cm²"),
+        kpi("Entries to re-check", str(v["n_data"] + sum(1 for n in notes if n["cat"] == "data")), "", f"{v['n_checks']} checks run", {"reliable": "ok", "some": "warn", "many": "crit"}[v["data_quality"]]),
     ]
-    section("01", "Test conditions & key figures", f"{an['n']} cylinders analysed")
-    md('<div class="kpis">' + "".join(cards) + "</div>")
-    section("02", "Diagnostic findings", "ranked by severity")
-    render_findings(an, peers)
-    section("03", "Charts", "bars turn amber / orange with the deviation from the engine mean")
+    section("01", "Verdict", f"{an['n']} cylinders analysed")
+    render_verdict(an)
+    md('<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(128px,1fr))">' + "".join(cards) + "</div>")
+    section("02", "Crew action list", "most urgent first - every step once")
+    render_plan(an)
+    section("03", "Entries to re-check", "the sheet itself is tested before its figures are trusted")
+    render_checks(an, p, notes)
+    section("04", "Diagnostic findings", "probable diagnosis first, then by severity")
+    render_findings(an, notes)
+    section("05", "Performance versus shop trial", "reference interpolated between the two load points")
+    md(shop_panel(an))
+    fr = chart_ref(an["ref"], th)
+    if fr is not None:
+        plot(fr, f"dg_{rid}_refdev")
+        md('<p class="note">* extrapolated slightly beyond the shop-trial load range · grey = no tolerance defined for that parameter.</p>')
+    md(ref_table(an))
+    md('<p class="note" style="margin-top:.5rem">“Core” parameters drive the findings. “Implied load” is the shop-trial load at which the reading would be normal: a figure far from the tested load '
+       'means the engine needs more (or less) than the shop-trial engine - or the kW reading is off. Readings that behave unphysically between the two blocks are marked inconsistent and not used.</p>')
+    section("06", "Cylinder charts", "bars turn amber / orange with the deviation from the engine mean")
     df = an["df"]
     ref = {r["key"]: r for r in an["ref"]}
 
@@ -1838,23 +2453,16 @@ def render_report(rep: dict, th: dict, peers_all: list) -> None:
         plot(chart_cyl(df, "rack", "rack_dev_pct", "Fuel rack position", "mm", th["rack_dev"], th["rack_dev_warn"], "%", "{:.1f}", rv, rl, an["mean"]["rack"]), f"dg_{rid}_rack")
     with b:
         plot(chart_cyl(df, "inj", "inj_dev", "Injection timing", "° BTDC", th["inj_spread"] / 2, th["inj_spread_warn"] / 2, "°", "{:.1f}", None, "", an["mean"]["inj"]), f"dg_{rid}_inj")
-    fr = chart_ref(an["ref"], th)
-    if fr is not None:
-        plot(fr, f"dg_{rid}_refdev")
-        md('<p class="note">* extrapolated slightly beyond the shop-trial load range · grey = no tolerance defined for that parameter.</p>')
-    section("04", "Cylinder summary")
+    section("07", "Cylinder summary")
     md(cylinder_table(p, an))
-    section("05", "Performance versus shop trial", "reference interpolated between the two load points printed on the sheet")
-    md(ref_table(an))
-    md('<p class="note" style="margin-top:.5rem">“Core” parameters drive the findings. The shop-trial block is typed in by the crew; where it is inconsistent the reference is not used and the comparison is marked indicative.</p>')
-    section("06", "All extracted readings", "every value with its source cell")
-    readings_tables(p)
-    section("07", "Export")
+    section("08", "All extracted readings", "every value with its source cell")
+    readings_tables(p, an)
+    section("09", "Export", "the HTML page is the printable crew action sheet")
     c1, c2, c3 = st.columns(3)
     base = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{vessel or rep['name']}_{lab}") + "_" + (p["identity"]["date"].strftime("%Y%m%d") if p["identity"].get("date") else "report")
     c1.download_button("All readings · CSV", export_csv(p, an), f"{base}.csv", "text/csv", key=f"dg_{rid}_csv", **stretch(st.download_button))
     c2.download_button("Full report · JSON", export_json(rep), f"{base}.json", "application/json", key=f"dg_{rid}_json", **stretch(st.download_button))
-    c3.download_button("Printable report · HTML", export_html(rep), f"{base}.html", "text/html", key=f"dg_{rid}_html", **stretch(st.download_button))
+    c3.download_button("Crew action sheet · HTML", export_html(rep, notes), f"{base}.html", "text/html", key=f"dg_{rid}_html", **stretch(st.download_button))
     with st.expander("Extraction audit · how every number was obtained"):
         render_audit(p)
 
@@ -1864,15 +2472,16 @@ def render_overview(reps: list, th: dict, peers_all: list) -> None:
     for r in reps:
         p = r["parsed"]
         if not p:
-            rows.append([esc(r["name"]), "—", "—", "—", "—", chip("unreadable", "crit"), "—", "—", "—", "—", "—", "—"])
+            rows.append([esc(r["name"]), "—", "—", "—", "—", chip("unreadable", "crit"), "—", "—", "—", "—", "—", "—", "—", "—"])
             continue
         s = summary_row(r["name"], p, r["an"])
         an = r["an"]
         lvl_tone = {"verified": "ok", "high": "info", "review": "warn", "low": "crit", "blank": "gold"}[p["confidence"]["level"]]
         rows.append([f'<b>{esc(s["vessel"])}</b>', esc(s["dg"]), s["date"].strftime("%d %b %Y") if s["date"] else "—", f'{s["load"] * 100:.0f} %' if s["load"] is not None else "—",
                      f'{s["run_hours"]:,.0f}' if s["run_hours"] else "—", chip(f'{s["confidence"]:.0f}%' if p["confidence"]["level"] != "blank" else "blank", lvl_tone),
-                     str(s["score"]) if an else "—", (chip(str(s["crit"]), "crit") if s["crit"] else '<span class="dim">0</span>') if an else "—",
-                     (chip(str(s["warn"]), "warn") if s["warn"] else '<span class="dim">0</span>') if an else "—", _num(s.get("exh"), 0) if an else "—",
+                     esc(s["verdict"]) if an else "—", str(s["score"]) if an else "—", (chip(str(s["crit"]), "crit") if s["crit"] else '<span class="dim">0</span>') if an else "—",
+                     (chip(str(s["warn"]), "warn") if s["warn"] else '<span class="dim">0</span>') if an else "—",
+                     (chip(str(s["n_data"]), "info") if s["n_data"] else '<span class="dim">0</span>') if an else "—", _num(s.get("exh"), 0) if an else "—",
                      _num(s.get("pmax_bar"), 1) if an else "—", _num(s.get("boost"), 2) if an else "—"])
         if an:
             ok_rows.append(dict(label=f'{s["vessel"]} · {s["dg"]}', score=an["score"]))
@@ -1880,11 +2489,13 @@ def render_overview(reps: list, th: dict, peers_all: list) -> None:
             if s["date"] and s["dg_no"]:
                 by_dg.setdefault((s["vessel"], s["dg"]), []).append(dict(date=s["date"], exh=s["exh"], pmax=s["pmax_bar"], rack=s["rack"], boost=s["boost"], load=s["load"]))
     section("F1", "Auxiliary engines overview", f"{len(reps)} report(s) loaded")
-    md(table_html(["Vessel", "DG", "Test date", "Load", "Run. hours", "Confidence", "Health", "Crit. / mech.", "Warnings", "Exhaust °C", "Pmax bar", "Boost"], rows))
+    md(table_html(["Vessel", "DG", "Test date", "Load", "Run. hours", "Confidence", "Verdict", "Health", "Crit. / mech.", "Warnings", "Re-check", "Exhaust °C", "Pmax bar", "Boost"], rows))
     if peers_all:
-        section("F2", "Generator vs generator", "same vessel")
+        section("F2", "Comparisons between reports", "generator vs generator, and the same generator over time")
         for n in peers_all:
-            md(f'<div class="fcard {n["sev"]}"><div class="ft"><span class="fh">{esc(n["vessel"])}</span>{chip(SEV_LABEL[n["sev"]], SEV_CHIP[n["sev"]])}</div><div class="ff">{esc(n["text"])}</div></div>')
+            md(f'<div class="fcard {n["sev"]}"><div class="ft"><span class="fh">{esc(n["vessel"])}</span>'
+               f'{chip("Check entry", "warn" if n["sev"] == "warning" else "info") if n["cat"] == "data" else chip(SEV_LABEL[n["sev"]], SEV_CHIP[n["sev"]])}</div>'
+               f'<div class="ff">{esc(n["text"])}</div><div class="fa"><b>Do</b>{esc(n["action"])}</div></div>')
     for vessel, lst in per_vessel.items():
         if len(lst) >= 2:
             md(f'<p class="lbl" style="margin-top:1rem">{esc(vessel)} · exhaust temperature versus load</p>')
@@ -1924,7 +2535,8 @@ def render_aux_tab() -> None:
         render_steps(1)
         render_empty()
         return
-    peers_all = peer_notes([(r["name"], r["parsed"], r["an"]) for r in reps if r["parsed"] and r["an"]])
+    items = [(r["name"], r["parsed"], r["an"]) for r in reps if r["parsed"] and r["an"]]
+    peers_all = peer_notes(items) + history_notes(items)
     if len(reps) == 1:
         render_report(reps[0], th, peers_all)
         return
